@@ -8,25 +8,24 @@ import os
 import time
 
 # ==================================================
-# CONFIG
+# GLOBAL SHARED STATE (THREAD SAFE)
 # ==================================================
-st.set_page_config(
-    page_title="GDrive PRO → YouTube Live",
-    page_icon="📡",
-    layout="wide"
-)
+GLOBAL_JOBS = {}
 
 DOWNLOAD_DIR = "videos"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ==================================================
-# SESSION STATE
+# STREAMLIT CONFIG
 # ==================================================
-if "jobs" not in st.session_state:
-    st.session_state.jobs = {}
+st.set_page_config(
+    page_title="GDrive PRO → YouTube Live (STABLE)",
+    page_icon="📡",
+    layout="wide"
+)
 
 # ==================================================
-# GOOGLE DRIVE DOWNLOAD (PRO + RESUME)
+# GOOGLE DRIVE DOWNLOAD (NO STREAMLIT HERE)
 # ==================================================
 def download_gdrive(file_id, output_path, job_id):
     URL = "https://docs.google.com/uc?export=download"
@@ -39,46 +38,49 @@ def download_gdrive(file_id, output_path, job_id):
         downloaded = os.path.getsize(output_path)
         headers["Range"] = f"bytes={downloaded}-"
 
-    response = session.get(URL, params={"id": file_id}, headers=headers, stream=True)
-    token = None
+    r = session.get(URL, params={"id": file_id}, headers=headers, stream=True)
 
-    for k, v in response.cookies.items():
+    token = None
+    for k, v in r.cookies.items():
         if k.startswith("download_warning"):
             token = v
 
     if token:
-        response = session.get(
+        r = session.get(
             URL,
             params={"id": file_id, "confirm": token},
             headers=headers,
             stream=True
         )
 
-    total = int(response.headers.get("Content-Length", 0)) + downloaded
+    total = int(r.headers.get("Content-Length", 0)) + downloaded
 
     mode = "ab" if downloaded else "wb"
     with open(output_path, mode) as f:
-        for chunk in response.iter_content(1024 * 256):
-            if chunk:
-                f.write(chunk)
-                downloaded += len(chunk)
-                st.session_state.jobs[job_id]["progress"] = downloaded / total
+        for chunk in r.iter_content(1024 * 256):
+            if not chunk:
+                continue
+            f.write(chunk)
+            downloaded += len(chunk)
 
-    st.session_state.jobs[job_id]["download_done"] = True
+            GLOBAL_JOBS[job_id]["progress"] = downloaded / total
+
+    GLOBAL_JOBS[job_id]["download_done"] = True
 
 # ==================================================
-# FFMPEG AUTO RECONNECT
+# FFMPEG AUTO RECONNECT (NO STREAMLIT)
 # ==================================================
-def ffmpeg_loop(video_path, stream_key, shorts, job_id):
-    scale = "720:1280" if shorts else "1280:720"
-    rtmp = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
+def ffmpeg_loop(job_id):
+    job = GLOBAL_JOBS[job_id]
+    scale = "720:1280" if job["shorts"] else "1280:720"
+    rtmp = f"rtmp://a.rtmp.youtube.com/live2/{job['key']}"
 
-    while st.session_state.jobs[job_id]["active"]:
+    while job["active"]:
         cmd = [
             "ffmpeg",
             "-re",
             "-stream_loop", "-1",
-            "-i", video_path,
+            "-i", job["path"],
             "-vf", f"scale={scale}",
             "-c:v", "libx264",
             "-preset", "veryfast",
@@ -96,21 +98,21 @@ def ffmpeg_loop(video_path, stream_key, shorts, job_id):
         ]
 
         p = subprocess.Popen(cmd)
-        st.session_state.jobs[job_id]["ffmpeg"] = p
+        job["ffmpeg"] = p
         p.wait()
         time.sleep(3)
 
 # ==================================================
 # UI
 # ==================================================
-st.title("📡 Google Drive → YouTube Live (PRO VERSION)")
-st.caption("Download besar • Resume • Multi Stream • Auto Reconnect")
+st.title("📡 Google Drive → YouTube Live (PRO STABLE)")
+st.caption("No session_state in thread • Anti crash • GB+ safe")
 st.divider()
 
 with st.form("add"):
     gdrive = st.text_input("Google Drive Video Link")
     key = st.text_input("YouTube Stream Key", type="password")
-    mode = st.radio("Mode Video", ["Landscape", "Shorts"])
+    mode = st.radio("Mode", ["Landscape", "Shorts"])
     submit = st.form_submit_button("ADD STREAM")
 
     if submit:
@@ -119,11 +121,10 @@ with st.form("add"):
             st.error("Link Google Drive tidak valid")
         else:
             jid = str(uuid.uuid4())[:8]
-            file_id = match.group(1)
             path = os.path.join(DOWNLOAD_DIR, f"{jid}.mp4")
 
-            st.session_state.jobs[jid] = {
-                "file_id": file_id,
+            GLOBAL_JOBS[jid] = {
+                "file_id": match.group(1),
                 "path": path,
                 "key": key,
                 "shorts": mode == "Shorts",
@@ -135,51 +136,50 @@ with st.form("add"):
 
             threading.Thread(
                 target=download_gdrive,
-                args=(file_id, path, jid),
+                args=(match.group(1), path, jid),
                 daemon=True
             ).start()
 
-            st.success(f"Job {jid} ditambahkan")
+            st.success(f"Job {jid} dibuat")
 
 st.divider()
 
 # ==================================================
-# JOB LIST
+# JOB LIST UI (READ ONLY)
 # ==================================================
-for jid, job in list(st.session_state.jobs.items()):
-    with st.container():
-        st.subheader(f"🎬 JOB {jid}")
+for jid, job in list(GLOBAL_JOBS.items()):
+    st.subheader(f"🎬 JOB {jid}")
 
-        if not job["download_done"]:
-            st.progress(job["progress"])
-            st.write("⬇️ Downloading...")
-        else:
-            st.success("Download selesai")
-            if job["ffmpeg"] is None:
-                threading.Thread(
-                    target=ffmpeg_loop,
-                    args=(job["path"], job["key"], job["shorts"], jid),
-                    daemon=True
-                ).start()
-                st.info("📡 Streaming dimulai")
+    if not job["download_done"]:
+        st.progress(job["progress"])
+        st.write("⬇️ Downloading...")
+    else:
+        st.success("Download selesai")
+        if job["ffmpeg"] is None:
+            threading.Thread(
+                target=ffmpeg_loop,
+                args=(jid,),
+                daemon=True
+            ).start()
+            st.info("📡 Streaming dimulai")
 
-        col1, col2 = st.columns(2)
+    col1, col2 = st.columns(2)
 
-        with col1:
-            if st.button(f"STOP {jid}"):
-                job["active"] = False
-                if job["ffmpeg"]:
-                    job["ffmpeg"].terminate()
-                st.warning("Streaming dihentikan")
+    with col1:
+        if st.button(f"STOP {jid}"):
+            job["active"] = False
+            if job["ffmpeg"]:
+                job["ffmpeg"].terminate()
+            st.warning("Stopped")
 
-        with col2:
-            if st.button(f"DELETE {jid}"):
-                job["active"] = False
-                if job["ffmpeg"]:
-                    job["ffmpeg"].terminate()
-                if os.path.exists(job["path"]):
-                    os.remove(job["path"])
-                del st.session_state.jobs[jid]
-                st.error("Job dihapus")
+    with col2:
+        if st.button(f"DELETE {jid}"):
+            job["active"] = False
+            if job["ffmpeg"]:
+                job["ffmpeg"].terminate()
+            if os.path.exists(job["path"]):
+                os.remove(job["path"])
+            del GLOBAL_JOBS[jid]
+            st.error("Deleted")
 
-        st.divider()
+    st.divider()
