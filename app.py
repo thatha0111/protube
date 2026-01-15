@@ -1,124 +1,130 @@
-import sys
+import os
 import subprocess
 import threading
-import os
-import shutil
 import streamlit as st
 
 # =========================
-# STREAMLIT CONFIG
+# PAGE CONFIG
 # =========================
 st.set_page_config(
-    page_title="🔥 YouTube Link → Live (Forced)",
-    page_icon="🔥",
+    page_title="YouTube Live Uploader",
+    page_icon="📡",
     layout="wide"
 )
 
-st.title("🔥 YouTube Link → Live Stream (FORCED MODE)")
-st.warning(
-    "Mode ini:\n"
-    "- Download video YouTube dulu\n"
-    "- Disimpan jadi file lokal\n"
-    "- Di-loop ke YouTube Live\n\n"
-    "❌ BUKAN real-time YouTube live source"
-)
+# =========================
+# HEADER
+# =========================
+st.markdown("""
+<style>
+.main-title {
+    font-size: 36px;
+    font-weight: 800;
+}
+.card {
+    padding: 20px;
+    border-radius: 15px;
+    background: #0f172a;
+    color: white;
+}
+.log-box {
+    background: #020617;
+    padding: 15px;
+    border-radius: 10px;
+    font-family: monospace;
+    font-size: 13px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="main-title">📡 YouTube Live Streaming (Upload Mode)</div>', unsafe_allow_html=True)
+st.caption("Upload video → Loop → YouTube Live (Cloud Safe)")
+
+st.divider()
 
 # =========================
-# CHECK DEPENDENCY
+# SESSION STATE
 # =========================
-def check_dep():
-    if not shutil.which("ffmpeg"):
-        st.error("❌ ffmpeg tidak tersedia")
-        st.stop()
-    if not shutil.which("yt-dlp"):
-        st.error("❌ yt-dlp tidak tersedia")
-        st.stop()
-
-check_dep()
-
-# =========================
-# LOGGER
-# =========================
-log_box = st.empty()
-logs = []
+if "logs" not in st.session_state:
+    st.session_state.logs = []
 
 def log(msg):
-    logs.append(msg)
-    log_box.text("\n".join(logs[-25:]))
-
-# =========================
-# DOWNLOAD YOUTUBE (ANTI 403)
-# =========================
-def download_youtube(url):
-    output_file = "temp_video.mp4"
-
-    if os.path.exists(output_file):
-        os.remove(output_file)
-
-    cmd = [
-        "yt-dlp",
-        "--no-check-certificate",
-        "--force-ipv4",
-        "--user-agent", "Mozilla/5.0 (Linux; Android 11)",
-        "--extractor-args", "youtube:player_client=android",
-        "--merge-output-format", "mp4",
-        "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
-        "-o", output_file,
-        url
-    ]
-
-    log("📥 Downloading YouTube video (forced android client)...")
-    log("CMD: " + " ".join(cmd))
-
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True
+    st.session_state.logs.append(msg)
+    log_placeholder.markdown(
+        '<div class="log-box">' +
+        "<br>".join(st.session_state.logs[-25:]) +
+        '</div>',
+        unsafe_allow_html=True
     )
 
-    for line in process.stdout:
-        log(line.strip())
+# =========================
+# LAYOUT
+# =========================
+left, right = st.columns([1, 1])
 
-    process.wait()
+with left:
+    st.markdown("### 🎞️ Upload Video")
+    uploaded = st.file_uploader(
+        "Format MP4 / FLV (H264 + AAC)",
+        type=["mp4", "flv"]
+    )
 
-    if not os.path.exists(output_file):
-        raise RuntimeError("❌ Download gagal (YouTube 403 / SABR block)")
+    if uploaded:
+        video_path = uploaded.name
+        with open(video_path, "wb") as f:
+            f.write(uploaded.read())
+        st.success("✅ Video siap digunakan")
+    else:
+        video_path = None
 
-    return output_file
+    st.markdown("### 🔑 Stream Key")
+    stream_key = st.text_input(
+        "YouTube Stream Key",
+        type="password",
+        placeholder="xxxx-xxxx-xxxx-xxxx"
+    )
+
+    st.markdown("### 📐 Mode Video")
+    mode = st.radio(
+        "Pilih format:",
+        ["Landscape (16:9)", "Shorts (9:16)"]
+    )
+
+with right:
+    st.markdown("### 📊 Status Streaming")
+    log_placeholder = st.empty()
 
 # =========================
-# FFMPEG STREAM
+# FFMPEG FUNCTION
 # =========================
-def run_ffmpeg(video_path, stream_key, is_shorts):
-    output_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
+def run_ffmpeg(video, key, is_shorts):
     scale = "720:1280" if is_shorts else "1280:720"
+    rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{key}"
 
     cmd = [
         "ffmpeg",
         "-stream_loop", "-1",
-        "-fflags", "+genpts",
         "-re",
-        "-i", video_path,
+        "-i", video,
         "-vf", f"scale={scale}",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-tune", "zerolatency",
-        "-b:v", "2500k",
-        "-maxrate", "2500k",
-        "-bufsize", "5000k",
+        "-b:v", "3000k",
+        "-maxrate", "3000k",
+        "-bufsize", "6000k",
         "-g", "60",
         "-keyint_min", "60",
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "128k",
         "-ar", "44100",
         "-f", "flv",
-        "-flvflags", "no_duration_filesize",
-        output_url
+        rtmp_url
     ]
 
-    log("🚀 Starting FFmpeg streaming...")
-    log("CMD: " + " ".join(cmd))
+    log("🚀 Streaming dimulai...")
+    log(" ".join(cmd))
 
     process = subprocess.Popen(
         cmd,
@@ -131,45 +137,24 @@ def run_ffmpeg(video_path, stream_key, is_shorts):
         log(line.strip())
 
 # =========================
-# UI INPUT
+# CONTROLS
 # =========================
-yt_url = st.text_input(
-    "🔗 Link YouTube",
-    placeholder="https://youtu.be/xxxxx"
-)
+st.divider()
+col1, col2 = st.columns(2)
 
-stream_key = st.text_input(
-    "🔑 YouTube Stream Key",
-    type="password"
-)
-
-is_shorts = st.checkbox("📱 Mode Shorts (720x1280)", value=False)
-
-# =========================
-# BUTTON ACTIONS
-# =========================
-if st.button("🔥 PAKSA LIVE"):
-    if not yt_url or not stream_key:
-        st.error("❌ Link YouTube dan Stream Key wajib diisi")
-    else:
-        try:
-            video_file = download_youtube(yt_url)
+with col1:
+    if st.button("▶️ MULAI LIVE", use_container_width=True):
+        if not video_path or not stream_key:
+            st.error("Video dan Stream Key wajib diisi")
+        else:
             threading.Thread(
                 target=run_ffmpeg,
-                args=(video_file, stream_key, is_shorts),
+                args=(video_path, stream_key, mode.startswith("Shorts")),
                 daemon=True
             ).start()
-            st.success("✅ Streaming dimulai (FORCED MODE)")
-        except Exception as e:
-            st.error(str(e))
+            st.success("Live dimulai")
 
-if st.button("🛑 STOP"):
-    os.system("pkill ffmpeg")
-    if os.path.exists("temp_video.mp4"):
-        os.remove("temp_video.mp4")
-    st.warning("⚠️ Streaming dihentikan")
-
-# =========================
-# SHOW LOG
-# =========================
-log_box.text("\n".join(logs[-25:]))
+with col2:
+    if st.button("🛑 STOP LIVE", use_container_width=True):
+        os.system("pkill ffmpeg")
+        st.warning("Streaming dihentikan")
