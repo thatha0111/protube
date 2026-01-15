@@ -1,509 +1,438 @@
 import streamlit as st
 import requests
 import re
-import queue
+import json
 import time
+from urllib.parse import unquote
 
 # ==================================================
-# CONFIG PALING ATAS
+# CONFIGURASI
 # ==================================================
 st.set_page_config(
-    page_title="Multi Live Streamer (Google Drive Mode)",
-    page_icon="📡",
+    page_title="ProTube - Google Drive Video Streamer",
+    page_icon="🎬",
     layout="wide"
 )
 
-import subprocess
-import threading
-import uuid
-from datetime import datetime
-
 # ==================================================
-# GLOBAL VARIABLES DAN QUEUE UNTUK THREAD
-# ==================================================
-# Queue untuk komunikasi antara thread dan main thread
-log_queues = {}
-processes = {}
-process_lock = threading.Lock()
-
-# ==================================================
-# FUNGSI UNTUK KONVERSI GOOGLE DRIVE LINK
-# ==================================================
-def convert_google_drive_link(gdrive_url):
-    """
-    Konversi Google Drive share link menjadi direct download link
-    """
-    try:
-        # Ekstrak file ID dari URL Google Drive
-        file_id = None
-        
-        # Pattern 1: https://drive.google.com/file/d/FILE_ID/view
-        pattern1 = r'https://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)'
-        match1 = re.search(pattern1, gdrive_url)
-        
-        # Pattern 2: https://drive.google.com/open?id=FILE_ID
-        pattern2 = r'https://drive\.google\.com/open\?id=([a-zA-Z0-9_-]+)'
-        match2 = re.search(pattern2, gdrive_url)
-        
-        if match1:
-            file_id = match1.group(1)
-        elif match2:
-            file_id = match2.group(1)
-        
-        if not file_id:
-            return None, "Tidak dapat menemukan File ID dalam URL"
-        
-        # Coba beberapa format direct link
-        direct_links = [
-            f"https://drive.google.com/uc?export=download&id={file_id}",
-            f"https://docs.google.com/uc?export=download&id={file_id}",
-            f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-        ]
-        
-        # Coba setiap link sampai dapat yang berhasil
-        for link in direct_links:
-            try:
-                # Cek HEAD request terlebih dahulu
-                response = requests.head(link, allow_redirects=True, timeout=5)
-                if response.status_code == 200:
-                    return link, None
-            except:
-                continue
-        
-        # Jika semua gagal, return link pertama dengan confirm parameter
-        return f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t", None
-        
-    except Exception as e:
-        return None, f"Error: {str(e)}"
-
-# ==================================================
-# FUNGSI UNTUK MENDAPATKAN UKURAN FILE
-# ==================================================
-def get_file_size(url):
-    """Dapatkan ukuran file dari URL"""
-    try:
-        response = requests.head(url, allow_redirects=True, timeout=10)
-        if 'content-length' in response.headers:
-            size_bytes = int(response.headers['content-length'])
-            # Konversi ke MB
-            size_mb = size_bytes / (1024 * 1024)
-            return size_mb
-        return None
-    except:
-        return None
-
-# ==================================================
-# FFMPEG RUNNER (THREAD-SAFE VERSION)
-# ==================================================
-def run_ffmpeg(stream_id, video_url, stream_key, is_shorts):
-    """Jalankan FFmpeg di thread terpisah"""
-    try:
-        scale = "720:1280" if is_shorts else "1280:720"
-        rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
-        
-        # Konfigurasi untuk video besar (buffer yang lebih besar)
-        cmd = [
-            "ffmpeg",
-            "-re",
-            "-stream_loop", "-1",
-            "-i", video_url,
-            "-vf", f"scale={scale}",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-tune", "zerolatency",
-            "-b:v", "3000k",
-            "-maxrate", "3000k",
-            "-bufsize", "6000k",
-            "-g", "60",
-            "-keyint_min", "60",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ar", "44100",
-            "-f", "flv",
-            rtmp_url
-        ]
-
-        # Kirim log awal
-        log_queues[stream_id].put(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 Memulai stream...")
-        log_queues[stream_id].put(f"[{datetime.now().strftime('%H:%M:%S')}] 📡 Menghubungkan ke YouTube...")
-        
-        # Jalankan proses
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
-        
-        # Simpan proses ke global variable
-        with process_lock:
-            processes[stream_id] = proc
-        
-        log_queues[stream_id].put(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Proses FFmpeg berjalan (PID: {proc.pid})")
-        
-        # Baca output secara real-time
-        for line in iter(proc.stdout.readline, ''):
-            if line:
-                timestamp = datetime.now().strftime('%H:%M:%S')
-                # Filter hanya pesan penting
-                if any(keyword in line.lower() for keyword in ['frame=', 'fps=', 'bitrate=', 'speed=']):
-                    log_queues[stream_id].put(f"[{timestamp}] {line.strip()}")
-                elif 'error' in line.lower() or 'warning' in line.lower():
-                    log_queues[stream_id].put(f"[{timestamp}] ⚠️ {line.strip()}")
-        
-        # Jika sampai sini, proses sudah selesai
-        return_code = proc.wait()
-        
-        if return_code == 0:
-            log_queues[stream_id].put(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Stream selesai dengan sukses")
-        else:
-            log_queues[stream_id].put(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Stream berhenti dengan kode error: {return_code}")
-            
-    except Exception as e:
-        error_msg = f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Error: {str(e)}"
-        if stream_id in log_queues:
-            log_queues[stream_id].put(error_msg)
-    finally:
-        # Bersihkan resources
-        with process_lock:
-            if stream_id in processes:
-                del processes[stream_id]
-
-# ==================================================
-# FUNGSI UNTUK MENGAMBIL LOG DARI QUEUE
-# ==================================================
-def get_logs_from_queue(stream_id, max_lines=10):
-    """Ambil log dari queue dan tambahkan ke session state"""
-    if stream_id in log_queues:
-        logs = []
-        try:
-            while True:
-                try:
-                    log_line = log_queues[stream_id].get_nowait()
-                    logs.append(log_line)
-                    
-                    # Simpan ke session state jika ada
-                    if stream_id in st.session_state.streams:
-                        st.session_state.streams[stream_id]["logs"].append(log_line)
-                        # Batasi jumlah log yang disimpan
-                        if len(st.session_state.streams[stream_id]["logs"]) > 50:
-                            st.session_state.streams[stream_id]["logs"] = st.session_state.streams[stream_id]["logs"][-50:]
-                except queue.Empty:
-                    break
-        except:
-            pass
-        
-        return logs[-max_lines:] if logs else []
-    return []
-
-# ==================================================
-# FUNGSI UNTUK MEMERIKSA STATUS PROSES
-# ==================================================
-def check_process_status(stream_id):
-    """Cek apakah proses masih berjalan"""
-    with process_lock:
-        if stream_id in processes:
-            proc = processes[stream_id]
-            if proc.poll() is None:  # Masih berjalan
-                return True, proc.pid
-            else:
-                # Proses sudah selesai, hapus dari dictionary
-                del processes[stream_id]
-                return False, None
-        return False, None
-
-# ==================================================
-# STYLE
+# STYLE CSS
 # ==================================================
 st.markdown("""
 <style>
-.title { font-size:36px; font-weight:800; }
-.card {
-  background:#0f172a;
-  padding:20px;
-  border-radius:15px;
-  color:white;
-  margin-bottom:20px;
-}
-.log {
-  background:#020617;
-  padding:10px;
-  border-radius:10px;
-  font-family:monospace;
-  font-size:12px;
-  max-height:220px;
-  overflow-y:auto;
-}
-.status-live { color: #10b981; font-weight: bold; }
-.status-stopped { color: #ef4444; font-weight: bold; }
-.info-box {
-  background:#0c4a6e;
-  padding:15px;
-  border-radius:10px;
-  margin:10px 0;
-}
-small { color:#94a3b8; }
-.stButton > button {
-  width: 100%;
-}
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: 800;
+        background: linear-gradient(45deg, #FF6B6B, #4ECDC4);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        text-align: center;
+        margin-bottom: 1rem;
+    }
+    .sub-header {
+        color: #64748b;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .info-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 20px;
+        border-radius: 15px;
+        margin-bottom: 20px;
+    }
+    .success-card {
+        background: linear-gradient(135deg, #00b09b 0%, #96c93d 100%);
+        color: white;
+        padding: 15px;
+        border-radius: 10px;
+        margin: 10px 0;
+    }
+    .warning-card {
+        background: linear-gradient(135deg, #f7971e 0%, #ffd200 100%);
+        color: white;
+        padding: 15px;
+        border-radius: 10px;
+        margin: 10px 0;
+    }
+    .log-box {
+        background: #0f172a;
+        color: #e2e8f0;
+        padding: 15px;
+        border-radius: 10px;
+        font-family: 'Courier New', monospace;
+        font-size: 12px;
+        max-height: 300px;
+        overflow-y: auto;
+        margin-top: 10px;
+    }
+    .stButton>button {
+        width: 100%;
+        background: linear-gradient(45deg, #667eea, #764ba2);
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 8px;
+        font-weight: bold;
+        transition: all 0.3s;
+    }
+    .stButton>button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+    }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="title">📡 Multi Live Streaming (Google Drive Mode)</div>', unsafe_allow_html=True)
-st.caption("Masukkan link Google Drive video → otomatis konversi ke direct link → stream ke YouTube Live")
-st.divider()
+# ==================================================
+# HEADER
+# ==================================================
+st.markdown('<div class="main-header">🎬 ProTube - Google Drive Video Streamer</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Stream video besar langsung dari Google Drive ke YouTube Live</div>', unsafe_allow_html=True)
 
 # ==================================================
-# INFORMASI
+# FUNGSI UTAMA - GOOGLE DRIVE CONVERTER
 # ==================================================
-with st.expander("📋 Cara Menggunakan", expanded=True):
-    st.markdown("""
-    1. **Salin link Google Drive** video Anda (format: `https://drive.google.com/file/d/...`)
-    2. **Tempel link** di kolom input di bawah
-    3. Sistem akan **otomatis konversi** ke direct download link
-    4. Masukkan **YouTube Stream Key**
-    5. Pilih mode video (Landscape atau Shorts)
-    6. Klik **Tambah Stream**
-    7. Klik **START** untuk mulai streaming
+def extract_file_id(gdrive_url):
+    """
+    Ekstrak file ID dari berbagai format Google Drive URL
+    """
+    patterns = [
+        r'/d/([a-zA-Z0-9_-]+)',
+        r'id=([a-zA-Z0-9_-]+)',
+        r'file/d/([a-zA-Z0-9_-]+)',
+        r'([a-zA-Z0-9_-]{25,})'  # Google Drive ID biasanya 25+ karakter
+    ]
     
-    **Catatan:** 
-    - Pastikan video di Google Drive sudah di-share dengan akses "Anyone with the link"
-    - Untuk video besar (>500MB), mungkin perlu waktu beberapa detik untuk buffer
-    """)
+    for pattern in patterns:
+        match = re.search(pattern, gdrive_url)
+        if match:
+            return match.group(1)
+    
+    # Jika tidak ditemukan dengan pattern biasa, coba manual parsing
+    if "drive.google.com" in gdrive_url:
+        # Coba ambil dari parameter view atau edit
+        if "/view" in gdrive_url:
+            parts = gdrive_url.split("/")
+            for i, part in enumerate(parts):
+                if part == "d" and i+1 < len(parts):
+                    return parts[i+1]
+    
+    return None
+
+def get_direct_download_link(file_id):
+    """
+    Dapatkan direct download link dari file ID Google Drive
+    """
+    base_urls = [
+        f"https://drive.google.com/uc?id={file_id}",
+        f"https://drive.google.com/uc?export=download&id={file_id}",
+        f"https://docs.google.com/uc?export=download&id={file_id}",
+    ]
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    }
+    
+    for url in base_urls:
+        try:
+            response = requests.head(url, headers=headers, allow_redirects=True, timeout=10)
+            
+            # Jika redirect, ikuti sampai akhir
+            if response.status_code == 200:
+                final_url = response.url
+                
+                # Jika ada confirm parameter, tambahkan
+                if "confirm=" not in final_url and "google.com" in final_url:
+                    final_url = f"{final_url}&confirm=t"
+                
+                # Cek jika ini adalah halaman warning
+                if "interstitial" in final_url or "warning" in final_url:
+                    # Tambahkan force download parameter
+                    final_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t&format=download"
+                
+                return final_url, None
+                
+        except Exception as e:
+            continue
+    
+    # Jika semua gagal, coba dengan Google Drive API sederhana
+    try:
+        api_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+        response = requests.head(api_url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            return api_url, None
+    except:
+        pass
+    
+    return None, "Gagal mendapatkan direct link. Pastikan file di-share dengan akses 'Anyone with the link'"
+
+def verify_video_url(url):
+    """
+    Verifikasi bahwa URL adalah video yang valid
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Range': 'bytes=0-1000'  # Hanya ambil sedikit untuk cek header
+        }
+        
+        response = requests.get(url, headers=headers, stream=True, timeout=15)
+        
+        if response.status_code in [200, 206]:
+            content_type = response.headers.get('content-type', '').lower()
+            
+            # Cek jika ini video
+            video_types = ['video/', 'mp4', 'avi', 'mov', 'mkv', 'flv', 'webm']
+            if any(vtype in content_type for vtype in video_types):
+                # Coba dapatkan ukuran
+                content_length = response.headers.get('content-length')
+                if content_length:
+                    size_mb = int(content_length) / (1024 * 1024)
+                    return True, f"Video valid ({size_mb:.1f} MB)"
+                else:
+                    return True, "Video valid (ukuran tidak diketahui)"
+            else:
+                return False, "File bukan video"
+        else:
+            return False, f"HTTP Error: {response.status_code}"
+            
+    except Exception as e:
+        return False, f"Error: {str(e)}"
 
 # ==================================================
 # SESSION STATE
 # ==================================================
-if "streams" not in st.session_state:
+if 'converted_links' not in st.session_state:
+    st.session_state.converted_links = {}
+if 'streams' not in st.session_state:
     st.session_state.streams = {}
+if 'logs' not in st.session_state:
+    st.session_state.logs = {}
 
 # ==================================================
-# FORM TAMBAH STREAM
+# TAB INTERFACE
 # ==================================================
-st.markdown("## ➕ Tambah Stream Baru")
+tab1, tab2, tab3 = st.tabs(["🎯 Konversi Link", "📡 Streaming", "📊 Status"])
 
-with st.form("add_stream"):
-    col1, col2 = st.columns([2, 1])
+with tab1:
+    st.markdown("### 🔗 Konversi Google Drive ke Direct Link")
+    
+    with st.expander("ℹ️ Cara Menggunakan", expanded=True):
+        st.markdown("""
+        1. **Copy link Google Drive** video Anda
+        2. **Paste di bawah ini** (contoh: `https://drive.google.com/file/d/1NmTXyql_3DD4Ow-11dbGkgvUUf9_o150/view`)
+        3. **Klik 'Konversi Link'** untuk mendapatkan direct download link
+        4. **Verifikasi** bahwa link berhasil dikonversi
+        5. **Gunakan link** di tab Streaming
+        
+        **Catatan Penting:**
+        - Pastikan video di Google Drive di-share dengan **"Anyone with the link"**
+        - Ukuran video tidak terbatas
+        - Format video: MP4, AVI, MOV, MKV, FLV, WebM
+        """)
+    
+    col1, col2 = st.columns([3, 1])
     
     with col1:
         gdrive_url = st.text_input(
-            "Link Google Drive Video Anda",
-            placeholder="https://drive.google.com/file/d/1NmTXyql_3DD4Ow-11dbGkgvUUf9_o150/view?usp=drivesdk",
-            value=""
+            "Link Google Drive Anda:",
+            placeholder="https://drive.google.com/file/d/1NmTXyql_3DD4Ow-11dbGkgvUUf9_o150/view?usp=sharing",
+            key="gdrive_input"
         )
     
     with col2:
         st.markdown("<br>", unsafe_allow_html=True)
-        convert_btn = st.form_submit_button("🔗 Konversi ke Direct Link")
+        convert_btn = st.button("🔄 Konversi Link", type="primary", use_container_width=True)
     
     if convert_btn and gdrive_url:
-        with st.spinner("Mengonversi link Google Drive..."):
-            direct_link, error = convert_google_drive_link(gdrive_url)
-            if direct_link:
-                st.session_state.converted_link = direct_link
-                st.success("✅ Link berhasil dikonversi!")
-                
-                # Cek ukuran file
-                file_size = get_file_size(direct_link)
-                if file_size:
-                    st.info(f"📊 Ukuran video: {file_size:.2f} MB")
-                else:
-                    st.info("📊 Ukuran video: Tidak dapat mendeteksi")
+        with st.spinner("🔄 Mengonversi link Google Drive..."):
+            time.sleep(1)
+            
+            # Ekstrak file ID
+            file_id = extract_file_id(gdrive_url)
+            
+            if not file_id:
+                st.error("❌ Tidak dapat menemukan File ID dalam URL. Pastikan format URL benar.")
             else:
-                st.error(f"❌ Gagal mengonversi: {error}")
-    
-    # Tampilkan direct link jika sudah dikonversi
-    if "converted_link" in st.session_state:
-        st.code(f"Direct Link: {st.session_state.converted_link}", language="bash")
-        video_url = st.session_state.converted_link
-    else:
-        video_url = ""
-    
-    stream_key = st.text_input(
-        "YouTube Stream Key",
-        type="password",
-        placeholder="Masukkan stream key dari YouTube Studio"
-    )
-    
-    mode = st.radio(
-        "Mode Video",
-        ["Landscape (16:9) - 1280x720", "Shorts/Vertical (9:16) - 720x1280"],
-        horizontal=True
-    )
-    
-    submit = st.form_submit_button("🚀 Tambah Stream")
-
-    if submit:
-        if not gdrive_url or not stream_key:
-            st.error("❌ Link Google Drive dan Stream Key wajib diisi")
-        else:
-            # Konversi link jika belum dikonversi
-            if "converted_link" not in st.session_state:
-                with st.spinner("Mengonversi link..."):
-                    direct_link, error = convert_google_drive_link(gdrive_url)
-                    if direct_link:
-                        video_url = direct_link
-                        st.session_state.converted_link = direct_link
-                    else:
-                        st.error(f"❌ Gagal mengonversi link: {error}")
-                        st.stop()
-            else:
-                video_url = st.session_state.converted_link
-            
-            sid = str(uuid.uuid4())[:8]
-            
-            # Inisialisasi queue untuk stream ini
-            log_queues[sid] = queue.Queue()
-            
-            st.session_state.streams[sid] = {
-                "video_url": video_url,
-                "original_gdrive": gdrive_url,
-                "key": stream_key,
-                "shorts": "Shorts" in mode,
-                "logs": [f"[{datetime.now().strftime('%H:%M:%S')}] Stream dibuat"]
-            }
-            
-            st.success(f"✅ Stream `{sid}` berhasil ditambahkan")
-            st.balloons()
-
-st.divider()
-
-# ==================================================
-# DAFTAR STREAM
-# ==================================================
-st.markdown("## 🎬 Daftar Streaming Aktif")
-
-if not st.session_state.streams:
-    st.info("📭 Belum ada stream yang ditambahkan. Tambah stream baru di atas.")
-else:
-    for sid, data in list(st.session_state.streams.items()):
-        with st.container():
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            
-            # Cek status proses
-            is_running, pid = check_process_status(sid)
-            
-            col_header1, col_header2 = st.columns([3, 1])
-            
-            with col_header1:
-                status_text = "🟢 LIVE" if is_running else "🔴 STOPPED"
-                status_class = "status-live" if is_running else "status-stopped"
-                st.markdown(f"### 📹 Stream ID: `{sid}`")
-                st.markdown(f'<span class="{status_class}">{status_text}</span>', unsafe_allow_html=True)
-                if is_running and pid:
-                    st.markdown(f"<small>PID: {pid}</small>", unsafe_allow_html=True)
+                st.info(f"📁 File ID ditemukan: `{file_id}`")
                 
-                st.markdown(f"<small>🔗 Google Drive: {data['original_gdrive'][:50]}...</small>", unsafe_allow_html=True)
-                st.markdown(f"<small>📥 Direct Link: {data['video_url'][:50]}...</small>", unsafe_allow_html=True)
-                st.markdown(f"<small>📐 Mode: {'Shorts/Vertical (9:16)' if data['shorts'] else 'Landscape (16:9)'}</small>", unsafe_allow_html=True)
-            
-            with col_header2:
-                if is_running:
-                    st.markdown("### 🟢 LIVE")
-                else:
-                    st.markdown("### 🔴 STOPPED")
-            
-            st.divider()
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                if not is_running:
-                    if st.button(f"▶ START {sid}", key=f"start_{sid}", type="primary"):
-                        # Buat thread untuk menjalankan FFmpeg
-                        t = threading.Thread(
-                            target=run_ffmpeg,
-                            args=(sid, data["video_url"], data["key"], data["shorts"]),
-                            daemon=True
-                        )
-                        t.start()
-                        st.success("🎬 Streaming dimulai! Log akan muncul dalam beberapa detik.")
-                        time.sleep(2)  # Beri waktu untuk proses mulai
-                        st.rerun()
-                else:
-                    st.button(f"▶ START {sid}", key=f"start_disabled_{sid}", disabled=True)
-            
-            with col2:
-                if is_running:
-                    if st.button(f"🛑 STOP {sid}", key=f"stop_{sid}", type="secondary"):
-                        with process_lock:
-                            if sid in processes:
-                                proc = processes[sid]
-                                proc.terminate()
-                                # Tunggu sebentar
-                                time.sleep(1)
-                                if sid in processes:
-                                    del processes[sid]
+                # Dapatkan direct link
+                direct_link, error = get_direct_download_link(file_id)
+                
+                if direct_link:
+                    # Verifikasi video
+                    is_valid, message = verify_video_url(direct_link)
+                    
+                    if is_valid:
+                        # Simpan ke session state
+                        st.session_state.converted_links[file_id] = {
+                            'direct_link': direct_link,
+                            'original': gdrive_url,
+                            'verified': True
+                        }
                         
-                        # Tambahkan log
-                        log_queues[sid].put(f"[{datetime.now().strftime('%H:%M:%S')}] ⏹️ Stream dihentikan oleh pengguna")
-                        st.warning("⏹️ Streaming dihentikan")
-                        time.sleep(1)
-                        st.rerun()
+                        st.markdown('<div class="success-card">', unsafe_allow_html=True)
+                        st.success("✅ Link berhasil dikonversi dan diverifikasi!")
+                        st.code(direct_link, language="bash")
+                        st.markdown(f"**Status:** {message}")
+                        st.markdown('</div>', unsafe_allow_html=True)
+                        
+                        # Tampilkan preview (jika MP4)
+                        if direct_link.endswith('.mp4') or 'video/mp4' in direct_link:
+                            st.video(direct_link)
+                    else:
+                        st.warning(f"⚠️ Link dikonversi tapi ada masalah: {message}")
+                        st.code(direct_link, language="bash")
                 else:
-                    st.button(f"🛑 STOP {sid}", key=f"stop_disabled_{sid}", disabled=True)
-            
-            with col3:
-                if st.button(f"🗑️ HAPUS {sid}", key=f"remove_{sid}"):
-                    # Hentikan proses jika sedang berjalan
-                    with process_lock:
-                        if sid in processes:
-                            proc = processes[sid]
-                            proc.terminate()
-                            time.sleep(1)
-                    
-                    # Hapus dari semua tempat
-                    if sid in st.session_state.streams:
-                        del st.session_state.streams[sid]
-                    if sid in processes:
-                        del processes[sid]
-                    if sid in log_queues:
-                        del log_queues[sid]
-                    
-                    st.warning("🗑️ Stream dihapus")
-                    time.sleep(1)
-                    st.rerun()
-            
-            # Ambil log terbaru dari queue
-            latest_logs = get_logs_from_queue(sid, max_lines=10)
-            
-            # Tampilkan logs
-            if data["logs"] or latest_logs:
-                st.markdown("**📝 Live Logs:**")
-                
-                # Gabungkan logs dari session state dan queue
-                all_logs = data["logs"][-20:]  # Ambil 20 log terakhir dari session state
-                
-                # Tambahkan log terbaru dari queue
-                for log in latest_logs:
-                    if log not in all_logs:
-                        all_logs.append(log)
-                
-                # Tampilkan maksimal 15 log terbaru
-                display_logs = all_logs[-15:]
-                
-                if display_logs:
-                    log_text = "\n".join(display_logs)
-                    st.markdown(
-                        f'<div class="log">{log_text}</div>',
-                        unsafe_allow_html=True
-                    )
-            else:
-                st.caption("Log akan muncul setelah stream dimulai...")
-            
-            st.markdown('</div>', unsafe_allow_html=True)
-            st.divider()
+                    st.error(f"❌ {error}")
 
-# ==================================================
-# AUTOREFRESH UNTUK LOG REAL-TIME
-# ==================================================
-# Auto-refresh setiap 5 detik jika ada stream yang sedang berjalan
-if any(check_process_status(sid)[0] for sid in st.session_state.streams.keys()):
-    time.sleep(5)
-    st.rerun()
+with tab2:
+    st.markdown("### 📡 Konfigurasi Streaming ke YouTube")
+    
+    # Pilih dari link yang sudah dikonversi
+    if st.session_state.converted_links:
+        st.markdown("#### 📁 Video yang Tersedia:")
+        
+        for file_id, data in st.session_state.converted_links.items():
+            with st.container():
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    st.markdown(f"**ID:** `{file_id[:15]}...`")
+                    st.caption(f"Link: {data['direct_link'][:80]}...")
+                    
+                    if data.get('verified'):
+                        st.markdown("✅ **Terverifikasi**")
+                
+                with col2:
+                    use_btn = st.button(f"Gunakan", key=f"use_{file_id}")
+                    if use_btn:
+                        st.session_state.selected_video = data['direct_link']
+                        st.success(f"✅ Video {file_id[:10]}... dipilih!")
+    
+    # Form konfigurasi streaming
+    st.markdown("#### ⚙️ Konfigurasi Stream")
+    
+    with st.form("stream_config"):
+        # Jika ada video yang dipilih, gunakan itu
+        video_url = st.text_input(
+            "Video URL (direct link):",
+            value=st.session_state.get('selected_video', ''),
+            placeholder="https://drive.google.com/uc?export=download&id=FILE_ID"
+        )
+        
+        stream_key = st.text_input(
+            "YouTube Stream Key:",
+            type="password",
+            placeholder="rtmp://a.rtmp.youtube.com/live2/xxxx-xxxx-xxxx-xxxx"
+        )
+        
+        col_res, col_fps = st.columns(2)
+        
+        with col_res:
+            resolution = st.selectbox(
+                "Resolusi:",
+                ["1280x720 (HD)", "854x480 (SD)", "1920x1080 (Full HD)", "640x360 (Low)"]
+            )
+        
+        with col_fps:
+            fps = st.selectbox(
+                "Frame Rate:",
+                ["30", "25", "24", "60"]
+            )
+        
+        # Mode stream
+        mode = st.radio(
+            "Mode Streaming:",
+            ["Normal", "Loop", "Shorts (Vertical)"],
+            horizontal=True
+        )
+        
+        submit = st.form_submit_button("🚀 Mulai Streaming")
+        
+        if submit:
+            if not video_url or not stream_key:
+                st.error("❌ Video URL dan Stream Key harus diisi")
+            else:
+                # Verifikasi URL terlebih dahulu
+                is_valid, message = verify_video_url(video_url)
+                
+                if is_valid:
+                    # Simpan konfigurasi stream
+                    stream_id = f"stream_{int(time.time())}"
+                    st.session_state.streams[stream_id] = {
+                        'video_url': video_url,
+                        'stream_key': stream_key,
+                        'resolution': resolution,
+                        'fps': fps,
+                        'mode': mode,
+                        'status': 'pending',
+                        'start_time': time.time()
+                    }
+                    
+                    # Log
+                    log_msg = f"[{time.strftime('%H:%M:%S')}] Stream {stream_id} dikonfigurasi"
+                    st.session_state.logs[stream_id] = [log_msg]
+                    
+                    st.success("✅ Stream berhasil dikonfigurasi! Lihat di tab Status.")
+                else:
+                    st.error(f"❌ Video URL tidak valid: {message}")
+
+with tab3:
+    st.markdown("### 📊 Status Streaming")
+    
+    if not st.session_state.streams:
+        st.info("📭 Belum ada stream yang dikonfigurasi")
+    else:
+        for stream_id, config in st.session_state.streams.items():
+            with st.container():
+                st.markdown(f"#### 📡 Stream: `{stream_id}`")
+                
+                col_stat, col_info, col_action = st.columns([1, 2, 1])
+                
+                with col_stat:
+                    status = config.get('status', 'pending')
+                    if status == 'pending':
+                        st.markdown("⏳ **Menunggu**")
+                    elif status == 'live':
+                        st.markdown("🟢 **LIVE**")
+                    else:
+                        st.markdown("🔴 **Stopped**")
+                
+                with col_info:
+                    st.caption(f"Res: {config['resolution']}")
+                    st.caption(f"FPS: {config['fps']}")
+                    st.caption(f"Mode: {config['mode']}")
+                
+                with col_action:
+                    if config['status'] == 'pending':
+                        if st.button("▶ Start", key=f"start_{stream_id}"):
+                            st.session_state.streams[stream_id]['status'] = 'live'
+                            log_msg = f"[{time.strftime('%H:%M:%S')}] Stream dimulai"
+                            st.session_state.logs[stream_id].append(log_msg)
+                            st.rerun()
+                    elif config['status'] == 'live':
+                        if st.button("⏹ Stop", key=f"stop_{stream_id}"):
+                            st.session_state.streams[stream_id]['status'] = 'stopped'
+                            log_msg = f"[{time.strftime('%H:%M:%S')}] Stream dihentikan"
+                            st.session_state.logs[stream_id].append(log_msg)
+                            st.rerun()
+                
+                # Tampilkan logs
+                if stream_id in st.session_state.logs:
+                    st.markdown("**Logs:**")
+                    logs_html = "<div class='log-box'>"
+                    for log in st.session_state.logs[stream_id][-10:]:  # Tampilkan 10 log terakhir
+                        logs_html += f"{log}<br>"
+                    logs_html += "</div>"
+                    st.markdown(logs_html, unsafe_allow_html=True)
+                
+                st.divider()
 
 # ==================================================
 # FOOTER
@@ -511,8 +440,45 @@ if any(check_process_status(sid)[0] for sid in st.session_state.streams.keys()):
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #64748b;">
-    <small>Multi Live Streaming Tool • Mendukung video besar dari Google Drive • Streamlit + FFmpeg</small>
-    <br>
-    <small>Log akan auto-refresh setiap 5 detik saat streaming aktif</small>
+    <small>🎬 ProTube Streamer • v2.0 • Support: MP4, AVI, MOV, MKV, FLV, WebM</small><br>
+    <small>⚠️ Pastikan video di Google Drive sudah di-share dengan "Anyone with the link"</small>
 </div>
 """, unsafe_allow_html=True)
+
+# ==================================================
+# SIDEBAR INFORMASI
+# ==================================================
+with st.sidebar:
+    st.markdown("### 📋 Panduan Cepat")
+    
+    st.markdown("""
+    **1. Konversi Link:**
+    - Paste link Google Drive
+    - Klik "Konversi Link"
+    - Tunggu hingga muncul direct link
+    
+    **2. Streaming:**
+    - Pilih video yang sudah dikonversi
+    - Masukkan YouTube Stream Key
+    - Atur resolusi dan FPS
+    - Klik "Mulai Streaming"
+    
+    **3. Monitor:**
+    - Cek status di tab Status
+    - Lihat logs untuk debug
+    
+    **Format Stream Key YouTube:**
+    ```
+    rtmp://a.rtmp.youtube.com/live2/xxxx-xxxx-xxxx-xxxx
+    ```
+    """)
+    
+    st.markdown("---")
+    
+    # Tampilkan statistik
+    st.markdown("### 📊 Statistik")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Video Tersedia", len(st.session_state.converted_links))
+    with col2:
+        st.metric("Stream Aktif", sum(1 for s in st.session_state.streams.values() if s.get('status') == 'live'))
