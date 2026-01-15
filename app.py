@@ -1,6 +1,8 @@
 import streamlit as st
 import requests
 import re
+import queue
+import time
 
 # ==================================================
 # CONFIG PALING ATAS
@@ -14,6 +16,15 @@ st.set_page_config(
 import subprocess
 import threading
 import uuid
+from datetime import datetime
+
+# ==================================================
+# GLOBAL VARIABLES DAN QUEUE UNTUK THREAD
+# ==================================================
+# Queue untuk komunikasi antara thread dan main thread
+log_queues = {}
+processes = {}
+process_lock = threading.Lock()
 
 # ==================================================
 # FUNGSI UNTUK KONVERSI GOOGLE DRIVE LINK
@@ -82,6 +93,129 @@ def get_file_size(url):
         return None
 
 # ==================================================
+# FFMPEG RUNNER (THREAD-SAFE VERSION)
+# ==================================================
+def run_ffmpeg(stream_id, video_url, stream_key, is_shorts):
+    """Jalankan FFmpeg di thread terpisah"""
+    try:
+        scale = "720:1280" if is_shorts else "1280:720"
+        rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
+        
+        # Konfigurasi untuk video besar (buffer yang lebih besar)
+        cmd = [
+            "ffmpeg",
+            "-re",
+            "-stream_loop", "-1",
+            "-i", video_url,
+            "-vf", f"scale={scale}",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-tune", "zerolatency",
+            "-b:v", "3000k",
+            "-maxrate", "3000k",
+            "-bufsize", "6000k",
+            "-g", "60",
+            "-keyint_min", "60",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-ar", "44100",
+            "-f", "flv",
+            rtmp_url
+        ]
+
+        # Kirim log awal
+        log_queues[stream_id].put(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 Memulai stream...")
+        log_queues[stream_id].put(f"[{datetime.now().strftime('%H:%M:%S')}] 📡 Menghubungkan ke YouTube...")
+        
+        # Jalankan proses
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+        
+        # Simpan proses ke global variable
+        with process_lock:
+            processes[stream_id] = proc
+        
+        log_queues[stream_id].put(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Proses FFmpeg berjalan (PID: {proc.pid})")
+        
+        # Baca output secara real-time
+        for line in iter(proc.stdout.readline, ''):
+            if line:
+                timestamp = datetime.now().strftime('%H:%M:%S')
+                # Filter hanya pesan penting
+                if any(keyword in line.lower() for keyword in ['frame=', 'fps=', 'bitrate=', 'speed=']):
+                    log_queues[stream_id].put(f"[{timestamp}] {line.strip()}")
+                elif 'error' in line.lower() or 'warning' in line.lower():
+                    log_queues[stream_id].put(f"[{timestamp}] ⚠️ {line.strip()}")
+        
+        # Jika sampai sini, proses sudah selesai
+        return_code = proc.wait()
+        
+        if return_code == 0:
+            log_queues[stream_id].put(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Stream selesai dengan sukses")
+        else:
+            log_queues[stream_id].put(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Stream berhenti dengan kode error: {return_code}")
+            
+    except Exception as e:
+        error_msg = f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Error: {str(e)}"
+        if stream_id in log_queues:
+            log_queues[stream_id].put(error_msg)
+    finally:
+        # Bersihkan resources
+        with process_lock:
+            if stream_id in processes:
+                del processes[stream_id]
+
+# ==================================================
+# FUNGSI UNTUK MENGAMBIL LOG DARI QUEUE
+# ==================================================
+def get_logs_from_queue(stream_id, max_lines=10):
+    """Ambil log dari queue dan tambahkan ke session state"""
+    if stream_id in log_queues:
+        logs = []
+        try:
+            while True:
+                try:
+                    log_line = log_queues[stream_id].get_nowait()
+                    logs.append(log_line)
+                    
+                    # Simpan ke session state jika ada
+                    if stream_id in st.session_state.streams:
+                        st.session_state.streams[stream_id]["logs"].append(log_line)
+                        # Batasi jumlah log yang disimpan
+                        if len(st.session_state.streams[stream_id]["logs"]) > 50:
+                            st.session_state.streams[stream_id]["logs"] = st.session_state.streams[stream_id]["logs"][-50:]
+                except queue.Empty:
+                    break
+        except:
+            pass
+        
+        return logs[-max_lines:] if logs else []
+    return []
+
+# ==================================================
+# FUNGSI UNTUK MEMERIKSA STATUS PROSES
+# ==================================================
+def check_process_status(stream_id):
+    """Cek apakah proses masih berjalan"""
+    with process_lock:
+        if stream_id in processes:
+            proc = processes[stream_id]
+            if proc.poll() is None:  # Masih berjalan
+                return True, proc.pid
+            else:
+                # Proses sudah selesai, hapus dari dictionary
+                del processes[stream_id]
+                return False, None
+        return False, None
+
+# ==================================================
 # STYLE
 # ==================================================
 st.markdown("""
@@ -103,6 +237,8 @@ st.markdown("""
   max-height:220px;
   overflow-y:auto;
 }
+.status-live { color: #10b981; font-weight: bold; }
+.status-stopped { color: #ef4444; font-weight: bold; }
 .info-box {
   background:#0c4a6e;
   padding:15px;
@@ -133,7 +269,9 @@ with st.expander("📋 Cara Menggunakan", expanded=True):
     6. Klik **Tambah Stream**
     7. Klik **START** untuk mulai streaming
     
-    **Catatan:** Pastikan video di Google Drive sudah di-share dengan akses "Anyone with the link"
+    **Catatan:** 
+    - Pastikan video di Google Drive sudah di-share dengan akses "Anyone with the link"
+    - Untuk video besar (>500MB), mungkin perlu waktu beberapa detik untuk buffer
     """)
 
 # ==================================================
@@ -141,56 +279,6 @@ with st.expander("📋 Cara Menggunakan", expanded=True):
 # ==================================================
 if "streams" not in st.session_state:
     st.session_state.streams = {}
-
-# ==================================================
-# FFMPEG RUNNER
-# ==================================================
-def run_ffmpeg(stream_id, video_url, stream_key, is_shorts):
-    scale = "720:1280" if is_shorts else "1280:720"
-    rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
-    
-    # Konfigurasi untuk video besar (buffer yang lebih besar)
-    cmd = [
-        "ffmpeg",
-        "-re",
-        "-stream_loop", "-1",
-        "-i", video_url,
-        "-vf", f"scale={scale}",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-tune", "zerolatency",
-        "-b:v", "3000k",
-        "-maxrate", "3000k",
-        "-bufsize", "6000k",
-        "-g", "60",
-        "-keyint_min", "60",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ar", "44100",
-        "-f", "flv",
-        rtmp_url
-    ]
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        universal_newlines=True
-    )
-
-    st.session_state.streams[stream_id]["process"] = proc
-
-    for line in iter(proc.stdout.readline, ''):
-        if line:
-            logs = st.session_state.streams[stream_id]["logs"]
-            logs.append(line.strip())
-            # Simpan hanya 50 log terakhir
-            if len(logs) > 50:
-                logs.pop(0)
-            st.session_state.streams[stream_id]["logs"] = logs
 
 # ==================================================
 # FORM TAMBAH STREAM
@@ -204,7 +292,7 @@ with st.form("add_stream"):
         gdrive_url = st.text_input(
             "Link Google Drive Video Anda",
             placeholder="https://drive.google.com/file/d/1NmTXyql_3DD4Ow-11dbGkgvUUf9_o150/view?usp=drivesdk",
-            value="https://drive.google.com/file/d/1NmTXyql_3DD4Ow-11dbGkgvUUf9_o150/view?usp=drivesdk"
+            value=""
         )
     
     with col2:
@@ -267,13 +355,15 @@ with st.form("add_stream"):
             
             sid = str(uuid.uuid4())[:8]
             
+            # Inisialisasi queue untuk stream ini
+            log_queues[sid] = queue.Queue()
+            
             st.session_state.streams[sid] = {
                 "video_url": video_url,
                 "original_gdrive": gdrive_url,
                 "key": stream_key,
                 "shorts": "Shorts" in mode,
-                "process": None,
-                "logs": []
+                "logs": [f"[{datetime.now().strftime('%H:%M:%S')}] Stream dibuat"]
             }
             
             st.success(f"✅ Stream `{sid}` berhasil ditambahkan")
@@ -293,65 +383,127 @@ else:
         with st.container():
             st.markdown('<div class="card">', unsafe_allow_html=True)
             
+            # Cek status proses
+            is_running, pid = check_process_status(sid)
+            
             col_header1, col_header2 = st.columns([3, 1])
             
             with col_header1:
+                status_text = "🟢 LIVE" if is_running else "🔴 STOPPED"
+                status_class = "status-live" if is_running else "status-stopped"
                 st.markdown(f"### 📹 Stream ID: `{sid}`")
+                st.markdown(f'<span class="{status_class}">{status_text}</span>', unsafe_allow_html=True)
+                if is_running and pid:
+                    st.markdown(f"<small>PID: {pid}</small>", unsafe_allow_html=True)
+                
                 st.markdown(f"<small>🔗 Google Drive: {data['original_gdrive'][:50]}...</small>", unsafe_allow_html=True)
                 st.markdown(f"<small>📥 Direct Link: {data['video_url'][:50]}...</small>", unsafe_allow_html=True)
                 st.markdown(f"<small>📐 Mode: {'Shorts/Vertical (9:16)' if data['shorts'] else 'Landscape (16:9)'}</small>", unsafe_allow_html=True)
             
             with col_header2:
-                status = "🔴 STOPPED" if data["process"] is None else "🟢 LIVE"
-                st.markdown(f"### {status}")
+                if is_running:
+                    st.markdown("### 🟢 LIVE")
+                else:
+                    st.markdown("### 🔴 STOPPED")
             
             st.divider()
             
-            col1, col2, col3 = st.columns([1, 1, 2])
+            col1, col2, col3 = st.columns(3)
             
             with col1:
-                if st.button(f"▶ START {sid}", key=f"start_{sid}", type="primary"):
-                    if data["process"] is None:
+                if not is_running:
+                    if st.button(f"▶ START {sid}", key=f"start_{sid}", type="primary"):
+                        # Buat thread untuk menjalankan FFmpeg
                         t = threading.Thread(
                             target=run_ffmpeg,
                             args=(sid, data["video_url"], data["key"], data["shorts"]),
                             daemon=True
                         )
                         t.start()
-                        st.success("🎬 Streaming dimulai! Periksa log di bawah.")
+                        st.success("🎬 Streaming dimulai! Log akan muncul dalam beberapa detik.")
+                        time.sleep(2)  # Beri waktu untuk proses mulai
                         st.rerun()
-                    else:
-                        st.warning("⚠️ Stream sudah berjalan")
+                else:
+                    st.button(f"▶ START {sid}", key=f"start_disabled_{sid}", disabled=True)
             
             with col2:
-                if st.button(f"🛑 STOP {sid}", key=f"stop_{sid}", type="secondary"):
-                    if data["process"]:
-                        data["process"].terminate()
-                        data["process"] = None
+                if is_running:
+                    if st.button(f"🛑 STOP {sid}", key=f"stop_{sid}", type="secondary"):
+                        with process_lock:
+                            if sid in processes:
+                                proc = processes[sid]
+                                proc.terminate()
+                                # Tunggu sebentar
+                                time.sleep(1)
+                                if sid in processes:
+                                    del processes[sid]
+                        
+                        # Tambahkan log
+                        log_queues[sid].put(f"[{datetime.now().strftime('%H:%M:%S')}] ⏹️ Stream dihentikan oleh pengguna")
                         st.warning("⏹️ Streaming dihentikan")
+                        time.sleep(1)
                         st.rerun()
+                else:
+                    st.button(f"🛑 STOP {sid}", key=f"stop_disabled_{sid}", disabled=True)
             
             with col3:
                 if st.button(f"🗑️ HAPUS {sid}", key=f"remove_{sid}"):
-                    if data["process"]:
-                        data["process"].terminate()
-                    del st.session_state.streams[sid]
+                    # Hentikan proses jika sedang berjalan
+                    with process_lock:
+                        if sid in processes:
+                            proc = processes[sid]
+                            proc.terminate()
+                            time.sleep(1)
+                    
+                    # Hapus dari semua tempat
+                    if sid in st.session_state.streams:
+                        del st.session_state.streams[sid]
+                    if sid in processes:
+                        del processes[sid]
+                    if sid in log_queues:
+                        del log_queues[sid]
+                    
                     st.warning("🗑️ Stream dihapus")
+                    time.sleep(1)
                     st.rerun()
             
+            # Ambil log terbaru dari queue
+            latest_logs = get_logs_from_queue(sid, max_lines=10)
+            
             # Tampilkan logs
-            if data["logs"]:
+            if data["logs"] or latest_logs:
                 st.markdown("**📝 Live Logs:**")
-                log_text = "\n".join(data["logs"][-20:])  # Tampilkan 20 log terakhir
-                st.markdown(
-                    f'<div class="log">{log_text}</div>',
-                    unsafe_allow_html=True
-                )
+                
+                # Gabungkan logs dari session state dan queue
+                all_logs = data["logs"][-20:]  # Ambil 20 log terakhir dari session state
+                
+                # Tambahkan log terbaru dari queue
+                for log in latest_logs:
+                    if log not in all_logs:
+                        all_logs.append(log)
+                
+                # Tampilkan maksimal 15 log terbaru
+                display_logs = all_logs[-15:]
+                
+                if display_logs:
+                    log_text = "\n".join(display_logs)
+                    st.markdown(
+                        f'<div class="log">{log_text}</div>',
+                        unsafe_allow_html=True
+                    )
             else:
                 st.caption("Log akan muncul setelah stream dimulai...")
             
             st.markdown('</div>', unsafe_allow_html=True)
             st.divider()
+
+# ==================================================
+# AUTOREFRESH UNTUK LOG REAL-TIME
+# ==================================================
+# Auto-refresh setiap 5 detik jika ada stream yang sedang berjalan
+if any(check_process_status(sid)[0] for sid in st.session_state.streams.keys()):
+    time.sleep(5)
+    st.rerun()
 
 # ==================================================
 # FOOTER
@@ -360,5 +512,7 @@ st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #64748b;">
     <small>Multi Live Streaming Tool • Mendukung video besar dari Google Drive • Streamlit + FFmpeg</small>
+    <br>
+    <small>Log akan auto-refresh setiap 5 detik saat streaming aktif</small>
 </div>
 """, unsafe_allow_html=True)
