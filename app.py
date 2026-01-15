@@ -8,7 +8,7 @@ import re
 # CONFIG
 # ==================================================
 st.set_page_config(
-    page_title="Multi Live Streamer (Google Drive Mode)",
+    page_title="Multi Live Streamer (Google Drive FIX)",
     page_icon="📡",
     layout="wide"
 )
@@ -26,25 +26,16 @@ st.markdown("""
   color:white;
   margin-bottom:20px;
 }
-.log {
-  background:#020617;
-  padding:10px;
-  border-radius:10px;
-  font-family:monospace;
-  font-size:12px;
-  max-height:220px;
-  overflow-y:auto;
-}
 small { color:#94a3b8; }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="title">📡 Multi Live Streaming (Google Drive)</div>', unsafe_allow_html=True)
-st.caption("Masukkan link Google Drive → otomatis stream ke YouTube Live")
+st.caption("FIX Thread + SessionState (Anti Error)")
 st.divider()
 
 # ==================================================
-# SESSION STATE
+# SESSION STATE INIT (WAJIB PALING ATAS)
 # ==================================================
 if "streams" not in st.session_state:
     st.session_state.streams = {}
@@ -52,153 +43,96 @@ if "streams" not in st.session_state:
 # ==================================================
 # GOOGLE DRIVE PARSER
 # ==================================================
-def convert_gdrive_to_direct(url):
-    """
-    Convert Google Drive share link to direct download URL
-    """
-    patterns = [
-        r"https://drive.google.com/file/d/([a-zA-Z0-9_-]+)",
-        r"https://drive.google.com/open\?id=([a-zA-Z0-9_-]+)",
-        r"https://drive.google.com/uc\?id=([a-zA-Z0-9_-]+)"
-    ]
-
-    for p in patterns:
-        match = re.search(p, url)
-        if match:
-            file_id = match.group(1)
-            return f"https://drive.google.com/uc?export=download&id={file_id}"
-
-    return url  # fallback kalau bukan gdrive
+def gdrive_direct(url):
+    match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
+    if match:
+        return f"https://drive.google.com/uc?export=download&id={match.group(1)}"
+    return url
 
 # ==================================================
-# FFMPEG RUNNER
+# FFMPEG THREAD (TIDAK SENTUH STREAMLIT)
 # ==================================================
-def run_ffmpeg(stream_id, video_url, stream_key, is_shorts):
-    scale = "720:1280" if is_shorts else "1280:720"
-    rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
-
-    cmd = [
-        "ffmpeg",
-        "-re",
-        "-stream_loop", "-1",
-        "-i", video_url,
-        "-vf", f"scale={scale}",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-tune", "zerolatency",
-        "-b:v", "3000k",
-        "-maxrate", "3000k",
-        "-bufsize", "6000k",
-        "-g", "60",
-        "-keyint_min", "60",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ar", "44100",
-        "-f", "flv",
-        rtmp_url
-    ]
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True
-    )
-
-    st.session_state.streams[stream_id]["process"] = proc
-
-    for line in proc.stdout:
-        logs = st.session_state.streams[stream_id]["logs"]
-        logs.append(line.strip())
-        st.session_state.streams[stream_id]["logs"] = logs[-50:]
+def ffmpeg_worker(cmd):
+    subprocess.Popen(cmd)
 
 # ==================================================
-# FORM TAMBAH STREAM
+# ADD STREAM FORM
 # ==================================================
 st.markdown("## ➕ Tambah Stream")
 
-with st.form("add_stream"):
-    gdrive_url = st.text_input(
-        "Google Drive Video Link",
-        placeholder="https://drive.google.com/file/d/xxxxx/view"
-    )
-
-    stream_key = st.text_input(
-        "YouTube Stream Key",
-        type="password"
-    )
-
-    mode = st.radio(
-        "Mode Video",
-        ["Landscape (16:9)", "Shorts (9:16)"]
-    )
-
-    submit = st.form_submit_button("Tambah Stream")
+with st.form("add"):
+    gdrive = st.text_input("Google Drive Link")
+    key = st.text_input("YouTube Stream Key", type="password")
+    mode = st.radio("Mode", ["Landscape", "Shorts"])
+    submit = st.form_submit_button("Tambah")
 
     if submit:
-        if not gdrive_url or not stream_key:
-            st.error("❌ Link Google Drive dan Stream Key wajib diisi")
+        if not gdrive or not key:
+            st.error("Link & Stream Key wajib")
         else:
-            direct_url = convert_gdrive_to_direct(gdrive_url)
             sid = str(uuid.uuid4())[:8]
-
             st.session_state.streams[sid] = {
-                "video_url": direct_url,
-                "key": stream_key,
-                "shorts": mode.startswith("Shorts"),
-                "process": None,
-                "logs": []
+                "url": gdrive_direct(gdrive),
+                "key": key,
+                "shorts": mode == "Shorts",
+                "process": None
             }
-
-            st.success("✅ Stream berhasil ditambahkan")
-            st.code(direct_url)
+            st.success(f"Stream {sid} ditambahkan")
 
 st.divider()
 
 # ==================================================
-# DAFTAR STREAM
+# STREAM LIST
 # ==================================================
-st.markdown("## 🎬 Daftar Streaming")
+st.markdown("## 🎬 Daftar Stream")
 
-if not st.session_state.streams:
-    st.info("Belum ada stream.")
-else:
-    for sid, data in list(st.session_state.streams.items()):
-        with st.container():
-            st.markdown('<div class="card">', unsafe_allow_html=True)
+for sid, data in list(st.session_state.streams.items()):
+    with st.container():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown(f"### ID: `{sid}`")
+        st.markdown(f"<small>{data['url']}</small>", unsafe_allow_html=True)
 
-            st.markdown(f"### Stream ID: `{sid}`")
-            st.markdown(f"<small>🔗 Source: {data['video_url']}</small>", unsafe_allow_html=True)
-            st.markdown(f"<small>📐 Mode: {'Shorts' if data['shorts'] else 'Landscape'}</small>", unsafe_allow_html=True)
+        col1, col2 = st.columns(2)
 
-            col1, col2 = st.columns(2)
+        scale = "720:1280" if data["shorts"] else "1280:720"
+        rtmp = f"rtmp://a.rtmp.youtube.com/live2/{data['key']}"
 
-            with col1:
-                if st.button(f"▶ START {sid}", key=f"start_{sid}"):
-                    if data["process"] is None:
-                        t = threading.Thread(
-                            target=run_ffmpeg,
-                            args=(sid, data["video_url"], data["key"], data["shorts"]),
-                            daemon=True
-                        )
-                        t.start()
-                        st.success("Streaming dimulai")
+        cmd = [
+            "ffmpeg",
+            "-re",
+            "-stream_loop", "-1",
+            "-i", data["url"],
+            "-vf", f"scale={scale}",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-tune", "zerolatency",
+            "-b:v", "3000k",
+            "-maxrate", "3000k",
+            "-bufsize", "6000k",
+            "-g", "60",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-ar", "44100",
+            "-f", "flv",
+            rtmp
+        ]
 
-            with col2:
-                if st.button(f"🛑 STOP {sid}", key=f"stop_{sid}"):
-                    if data["process"]:
-                        data["process"].terminate()
-                        data["process"] = None
-                        st.warning("Streaming dihentikan")
+        with col1:
+            if st.button(f"▶ START {sid}"):
+                if data["process"] is None:
+                    p = subprocess.Popen(cmd)
+                    data["process"] = p
+                    st.success("Streaming dimulai")
+                else:
+                    st.warning("Sudah berjalan")
 
-            if data["logs"]:
-                st.markdown(
-                    '<div class="log">' +
-                    "<br>".join(data["logs"]) +
-                    '</div>',
-                    unsafe_allow_html=True
-                )
+        with col2:
+            if st.button(f"🛑 STOP {sid}"):
+                if data["process"]:
+                    data["process"].terminate()
+                    data["process"] = None
+                    st.warning("Streaming dihentikan")
 
-            st.markdown('</div>', unsafe_allow_html=True)
-            st.divider()
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.divider()
