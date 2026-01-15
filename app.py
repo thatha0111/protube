@@ -1,24 +1,24 @@
-import os
-import subprocess
-import threading
-import uuid
 import streamlit as st
 
-# =========================
-# CONFIG
-# =========================
+# ==================================================
+# WAJIB PALING ATAS (SEBELUM UI APA PUN)
+# ==================================================
+st.config.set_option("server.maxUploadSize", 1536)  # 1.5 GB
+
 st.set_page_config(
     page_title="Multi Live Streamer",
     page_icon="📡",
     layout="wide"
 )
 
-# Upload limit 2GB
-st.config.set_option("server.maxUploadSize", 2048)
+import os
+import subprocess
+import threading
+import uuid
 
-# =========================
+# ==================================================
 # STYLE
-# =========================
+# ==================================================
 st.markdown("""
 <style>
 .title { font-size:36px; font-weight:800; }
@@ -32,19 +32,19 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="title">📡 Multi Live Streaming (Unlimited)</div>', unsafe_allow_html=True)
-st.caption("Upload file berbeda → Stream key berbeda → Jalan bersamaan")
+st.markdown('<div class="title">📡 Multi Live Streaming (1.5GB Stable)</div>', unsafe_allow_html=True)
+st.caption("Upload file berbeda → stream key berbeda → jalan bersamaan (Cloud-safe)")
 st.divider()
 
-# =========================
+# ==================================================
 # SESSION STATE
-# =========================
+# ==================================================
 if "streams" not in st.session_state:
     st.session_state.streams = {}
 
-# =========================
+# ==================================================
 # FFMPEG RUNNER
-# =========================
+# ==================================================
 def run_ffmpeg(stream_id, video, key, is_shorts):
     scale = "720:1280" if is_shorts else "1280:720"
     rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{key}"
@@ -85,14 +85,14 @@ def run_ffmpeg(stream_id, video, key, is_shorts):
         logs.append(line.strip())
         st.session_state.streams[stream_id]["logs"] = logs[-30:]
 
-# =========================
-# ADD NEW STREAM
-# =========================
+# ==================================================
+# ADD STREAM (UPLOAD CHUNKED)
+# ==================================================
 st.markdown("## ➕ Tambah Stream Baru")
 
 with st.form("add_stream"):
     uploaded = st.file_uploader(
-        "Upload Video (MP4 / FLV, max 2GB)",
+        "Upload Video (MP4 / FLV, max 1.5GB)",
         type=["mp4", "flv"]
     )
     stream_key = st.text_input("Stream Key", type="password")
@@ -106,8 +106,12 @@ with st.form("add_stream"):
             sid = str(uuid.uuid4())[:8]
             filename = f"{sid}_{uploaded.name}"
 
+            # === CHUNK WRITE (ANTI RAM SPIKE) ===
             with open(filename, "wb") as f:
-                f.write(uploaded.read())
+                for chunk in uploaded:
+                    f.write(chunk)
+
+            size_mb = os.path.getsize(filename) / 1024 / 1024
 
             st.session_state.streams[sid] = {
                 "video": filename,
@@ -117,14 +121,14 @@ with st.form("add_stream"):
                 "logs": []
             }
 
-            st.success(f"Stream {sid} ditambahkan")
+            st.success(f"Stream {sid} ditambahkan ({round(size_mb,2)} MB)")
 
 st.divider()
 
-# =========================
+# ==================================================
 # STREAM LIST
-# =========================
-st.markdown("## 🎬 Daftar Streaming Aktif")
+# ==================================================
+st.markdown("## 🎬 Daftar Streaming")
 
 for sid, data in list(st.session_state.streams.items()):
     with st.container():
