@@ -1,103 +1,51 @@
 import os
 import subprocess
 import threading
+import uuid
 import streamlit as st
 
 # =========================
-# PAGE CONFIG
+# CONFIG
 # =========================
 st.set_page_config(
-    page_title="YouTube Live Uploader",
+    page_title="Multi Live Streamer",
     page_icon="📡",
     layout="wide"
 )
 
+# Upload limit 2GB
+st.config.set_option("server.maxUploadSize", 2048)
+
 # =========================
-# HEADER
+# STYLE
 # =========================
 st.markdown("""
 <style>
-.main-title {
-    font-size: 36px;
-    font-weight: 800;
-}
+.title { font-size:36px; font-weight:800; }
 .card {
-    padding: 20px;
-    border-radius: 15px;
-    background: #0f172a;
-    color: white;
+  background:#0f172a; padding:20px; border-radius:15px; color:white;
 }
-.log-box {
-    background: #020617;
-    padding: 15px;
-    border-radius: 10px;
-    font-family: monospace;
-    font-size: 13px;
+.log {
+  background:#020617; padding:10px; border-radius:10px;
+  font-family:monospace; font-size:12px;
 }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-title">📡 YouTube Live Streaming (Upload Mode)</div>', unsafe_allow_html=True)
-st.caption("Upload video → Loop → YouTube Live (Cloud Safe)")
-
+st.markdown('<div class="title">📡 Multi Live Streaming (Unlimited)</div>', unsafe_allow_html=True)
+st.caption("Upload file berbeda → Stream key berbeda → Jalan bersamaan")
 st.divider()
 
 # =========================
 # SESSION STATE
 # =========================
-if "logs" not in st.session_state:
-    st.session_state.logs = []
-
-def log(msg):
-    st.session_state.logs.append(msg)
-    log_placeholder.markdown(
-        '<div class="log-box">' +
-        "<br>".join(st.session_state.logs[-25:]) +
-        '</div>',
-        unsafe_allow_html=True
-    )
+if "streams" not in st.session_state:
+    st.session_state.streams = {}
 
 # =========================
-# LAYOUT
+# FFMPEG RUNNER
 # =========================
-left, right = st.columns([1, 1])
-
-with left:
-    st.markdown("### 🎞️ Upload Video")
-    uploaded = st.file_uploader(
-        "Format MP4 / FLV (H264 + AAC)",
-        type=["mp4", "flv"]
-    )
-
-    if uploaded:
-        video_path = uploaded.name
-        with open(video_path, "wb") as f:
-            f.write(uploaded.read())
-        st.success("✅ Video siap digunakan")
-    else:
-        video_path = None
-
-    st.markdown("### 🔑 Stream Key")
-    stream_key = st.text_input(
-        "YouTube Stream Key",
-        type="password",
-        placeholder="xxxx-xxxx-xxxx-xxxx"
-    )
-
-    st.markdown("### 📐 Mode Video")
-    mode = st.radio(
-        "Pilih format:",
-        ["Landscape (16:9)", "Shorts (9:16)"]
-    )
-
-with right:
-    st.markdown("### 📊 Status Streaming")
-    log_placeholder = st.empty()
-
-# =========================
-# FFMPEG FUNCTION
-# =========================
-def run_ffmpeg(video, key, is_shorts):
+def run_ffmpeg(stream_id, video, key, is_shorts):
     scale = "720:1280" if is_shorts else "1280:720"
     rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{key}"
 
@@ -123,38 +71,97 @@ def run_ffmpeg(video, key, is_shorts):
         rtmp_url
     ]
 
-    log("🚀 Streaming dimulai...")
-    log(" ".join(cmd))
-
-    process = subprocess.Popen(
+    proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True
     )
 
-    for line in process.stdout:
-        log(line.strip())
+    st.session_state.streams[stream_id]["process"] = proc
+
+    for line in proc.stdout:
+        logs = st.session_state.streams[stream_id]["logs"]
+        logs.append(line.strip())
+        st.session_state.streams[stream_id]["logs"] = logs[-30:]
 
 # =========================
-# CONTROLS
+# ADD NEW STREAM
 # =========================
-st.divider()
-col1, col2 = st.columns(2)
+st.markdown("## ➕ Tambah Stream Baru")
 
-with col1:
-    if st.button("▶️ MULAI LIVE", use_container_width=True):
-        if not video_path or not stream_key:
+with st.form("add_stream"):
+    uploaded = st.file_uploader(
+        "Upload Video (MP4 / FLV, max 2GB)",
+        type=["mp4", "flv"]
+    )
+    stream_key = st.text_input("Stream Key", type="password")
+    mode = st.radio("Mode Video", ["Landscape", "Shorts"])
+    submit = st.form_submit_button("Tambah Stream")
+
+    if submit:
+        if not uploaded or not stream_key:
             st.error("Video dan Stream Key wajib diisi")
         else:
-            threading.Thread(
-                target=run_ffmpeg,
-                args=(video_path, stream_key, mode.startswith("Shorts")),
-                daemon=True
-            ).start()
-            st.success("Live dimulai")
+            sid = str(uuid.uuid4())[:8]
+            filename = f"{sid}_{uploaded.name}"
 
-with col2:
-    if st.button("🛑 STOP LIVE", use_container_width=True):
-        os.system("pkill ffmpeg")
-        st.warning("Streaming dihentikan")
+            with open(filename, "wb") as f:
+                f.write(uploaded.read())
+
+            st.session_state.streams[sid] = {
+                "video": filename,
+                "key": stream_key,
+                "shorts": mode == "Shorts",
+                "process": None,
+                "logs": []
+            }
+
+            st.success(f"Stream {sid} ditambahkan")
+
+st.divider()
+
+# =========================
+# STREAM LIST
+# =========================
+st.markdown("## 🎬 Daftar Streaming Aktif")
+
+for sid, data in list(st.session_state.streams.items()):
+    with st.container():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown(f"### Stream ID: `{sid}`")
+        st.write(f"📁 File: `{data['video']}`")
+        st.write(f"📐 Mode: {'Shorts' if data['shorts'] else 'Landscape'}")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if st.button(f"▶ START {sid}", key=f"start_{sid}"):
+                if data["process"] is None:
+                    t = threading.Thread(
+                        target=run_ffmpeg,
+                        args=(sid, data["video"], data["key"], data["shorts"]),
+                        daemon=True
+                    )
+                    t.start()
+                    st.success("Streaming dimulai")
+                else:
+                    st.warning("Stream sudah berjalan")
+
+        with col2:
+            if st.button(f"🛑 STOP {sid}", key=f"stop_{sid}"):
+                if data["process"]:
+                    data["process"].terminate()
+                    data["process"] = None
+                    st.warning("Streaming dihentikan")
+
+        if data["logs"]:
+            st.markdown(
+                '<div class="log">' +
+                "<br>".join(data["logs"]) +
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.divider()
