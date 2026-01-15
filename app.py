@@ -1,183 +1,135 @@
-#!/usr/bin/env python3
+import sys
 import subprocess
 import threading
-import shutil
-import sys
+import os
 import streamlit as st
 
-# ==============================
-# CHECK DEPENDENCY
-# ==============================
+st.set_page_config(
+    page_title="YouTube Link → Live (Forced)",
+    page_icon="🔥",
+    layout="wide"
+)
+
+st.title("🔥 YouTube Link → Live Stream (FORCED MODE)")
+st.warning(
+    "Mode ini DOWNLOAD video YouTube dulu, lalu di-loop ke Live.\n"
+    "BUKAN real-time YouTube Live source."
+)
+
+# ======================
+# CHECK FFMPEG
+# ======================
 def check_dep():
     if not shutil.which("ffmpeg"):
-        st.error("ffmpeg tidak ditemukan")
-        st.stop()
-    if not shutil.which("yt-dlp"):
-        st.error("yt-dlp tidak ditemukan")
+        st.error("ffmpeg tidak tersedia")
         st.stop()
 
-# ==============================
-# PLATFORM RTMP BASE
-# ==============================
-RTMP_BASE = {
-    "youtube": "rtmp://a.rtmp.youtube.com/live2/",
-    "facebook": "rtmp://live-api-s.facebook.com:80/rtmp/",
-    "tiktok": "rtmp://live.tiktok.com/live/"
-}
+# ======================
+# DOWNLOAD YOUTUBE
+# ======================
+def download_youtube(url, log):
+    output_file = "temp_video.mp4"
 
-# ==============================
-# PRESETS
-# ==============================
-PRESETS = {
-    "youtube": {
-        "video_bitrate": "4500k",
-        "audio_bitrate": "128k",
-        "fps": 30,
-        "resolution": "1280x720"
-    },
-    "facebook": {
-        "video_bitrate": "4000k",
-        "audio_bitrate": "128k",
-        "fps": 30,
-        "resolution": "1280x720"
-    },
-    "tiktok": {
-        "video_bitrate": "3000k",
-        "audio_bitrate": "128k",
-        "fps": 30,
-        "resolution": "720x1280"
-    }
-}
+    if os.path.exists(output_file):
+        os.remove(output_file)
 
-# ==============================
-# GET YOUTUBE STREAM URL
-# ==============================
-def get_youtube_stream(url):
-    cmd = ["yt-dlp", "-f", "best", "-g", url]
-    result = subprocess.run(
+    cmd = [
+        "yt-dlp",
+        "-f", "best[ext=mp4]/best",
+        "-o", output_file,
+        url
+    ]
+
+    log("Downloading YouTube video...")
+    process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True
     )
 
-    if result.returncode != 0:
-        st.error("Gagal mengambil stream YouTube")
-        st.code(result.stderr)
-        st.stop()
+    for line in process.stdout:
+        log(line.strip())
 
-    return result.stdout.strip().splitlines()[0]
+    process.wait()
 
-# ==============================
-# STREAM FUNCTION
-# ==============================
-def start_stream(
-    input_url,
-    rtmp_url,
-    preset,
-    video_bitrate,
-    audio_bitrate,
-    fps,
-    resolution,
-    log_box
-):
+    if not os.path.exists(output_file):
+        raise RuntimeError("Download gagal")
+
+    return output_file
+
+# ======================
+# STREAM WITH FFMPEG
+# ======================
+def run_ffmpeg(video_path, stream_key, is_shorts, log):
+    output_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
+    scale = "720:1280" if is_shorts else "1280:720"
+
     cmd = [
         "ffmpeg",
+        "-stream_loop", "-1",
         "-re",
-        "-i", input_url,
-        "-vf", f"scale={resolution}",
-        "-r", str(fps),
+        "-i", video_path,
+        "-vf", f"scale={scale}",
         "-c:v", "libx264",
         "-preset", "veryfast",
-        "-b:v", video_bitrate,
-        "-maxrate", video_bitrate,
-        "-bufsize", "2M",
-        "-pix_fmt", "yuv420p",
+        "-tune", "zerolatency",
+        "-b:v", "2500k",
+        "-maxrate", "2500k",
+        "-bufsize", "5000k",
+        "-g", "60",
+        "-keyint_min", "60",
         "-c:a", "aac",
-        "-b:a", audio_bitrate,
+        "-b:a", "128k",
+        "-ar", "44100",
         "-f", "flv",
-        rtmp_url
+        output_url
     ]
 
-    logs = []
+    log("Menjalankan FFmpeg...")
+    log(" ".join(cmd))
 
     process = subprocess.Popen(
         cmd,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True
     )
 
-    def monitor():
-        for line in process.stderr:
-            if "frame=" in line or "time=" in line:
-                logs.append(line.strip())
-                log_box.code("\n".join(logs[-20:]))
+    for line in process.stdout:
+        log(line.strip())
 
-    threading.Thread(target=monitor, daemon=True).start()
-    process.wait()
-
-# ==============================
-# STREAMLIT UI (CONVERTED MAIN)
-# ==============================
-st.set_page_config(page_title="YouTube Restreamer", layout="centered")
-st.title("YouTube → Live Stream (Streamlit)")
-
-st.warning(
-    "⚠️ Aplikasi ini HARUS dijalankan di Termux / VPS.\n\n"
-    "Streamlit Cloud tidak mendukung RTMP push."
-)
-
-check_dep()
-
-platform = st.selectbox(
-    "Pilih Platform",
-    ["youtube", "facebook", "tiktok", "custom"]
-)
-
-yt_url = st.text_input("Link YouTube")
-
-if platform == "custom":
-    rtmp_base = st.text_input("RTMP Base (tanpa stream key)")
-else:
-    rtmp_base = RTMP_BASE[platform]
-
-stream_key = st.text_input("Stream Key", type="password")
+# ======================
+# UI
+# ======================
+yt_url = st.text_input("🔗 Link YouTube", placeholder="https://youtu.be/xxxxx")
+stream_key = st.text_input("🔑 Stream Key YouTube", type="password")
+is_shorts = st.checkbox("Mode Shorts (720x1280)", value=False)
 
 log_box = st.empty()
+logs = []
 
-if st.button("▶ MULAI STREAM"):
+def log(msg):
+    logs.append(msg)
+    log_box.text("\n".join(logs[-20:]))
+
+if st.button("🔥 PAKSA LIVE"):
     if not yt_url or not stream_key:
-        st.error("Link YouTube dan Stream Key wajib diisi")
+        st.error("Link YouTube & Stream Key wajib diisi")
     else:
-        stream_url = get_youtube_stream(yt_url)
+        try:
+            video_file = download_youtube(yt_url, log)
+            threading.Thread(
+                target=run_ffmpeg,
+                args=(video_file, stream_key, is_shorts, log),
+                daemon=True
+            ).start()
+            st.success("Streaming dimulai (FORCED MODE)")
+        except Exception as e:
+            st.error(str(e))
 
-        final_rtmp = rtmp_base.rstrip("/") + "/" + stream_key
-
-        if platform in PRESETS:
-            p = PRESETS[platform]
-            start_stream(
-                stream_url,
-                final_rtmp,
-                platform,
-                p["video_bitrate"],
-                p["audio_bitrate"],
-                p["fps"],
-                p["resolution"],
-                log_box
-            )
-        else:
-            video_bitrate = st.text_input("Video Bitrate", "2500k")
-            audio_bitrate = st.text_input("Audio Bitrate", "128k")
-            fps = st.number_input("FPS", 1, 60, 30)
-            resolution = st.text_input("Resolusi", "1280x720")
-
-            start_stream(
-                stream_url,
-                final_rtmp,
-                "custom",
-                video_bitrate,
-                audio_bitrate,
-                fps,
-                resolution,
-                log_box
-            )
+if st.button("🛑 STOP"):
+    os.system("pkill ffmpeg")
+    if os.path.exists("temp_video.mp4"):
+        os.remove("temp_video.mp4")
+    st.warning("Streaming dihentikan")
