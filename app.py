@@ -1,17 +1,17 @@
 import streamlit as st
-
-# ==================================================
-# CONFIG PALING ATAS
-# ==================================================
-st.set_page_config(
-    page_title="Multi Live Streamer (URL Mode)",
-    page_icon="📡",
-    layout="wide"
-)
-
 import subprocess
 import threading
 import uuid
+import re
+
+# ==================================================
+# CONFIG
+# ==================================================
+st.set_page_config(
+    page_title="Multi Live Streamer (Google Drive Mode)",
+    page_icon="📡",
+    layout="wide"
+)
 
 # ==================================================
 # STYLE
@@ -39,8 +39,8 @@ small { color:#94a3b8; }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="title">📡 Multi Live Streaming (URL Mode)</div>', unsafe_allow_html=True)
-st.caption("Input direct video URL → stream ke YouTube Live (Streamlit Cloud Safe)")
+st.markdown('<div class="title">📡 Multi Live Streaming (Google Drive)</div>', unsafe_allow_html=True)
+st.caption("Masukkan link Google Drive → otomatis stream ke YouTube Live")
 st.divider()
 
 # ==================================================
@@ -48,6 +48,27 @@ st.divider()
 # ==================================================
 if "streams" not in st.session_state:
     st.session_state.streams = {}
+
+# ==================================================
+# GOOGLE DRIVE PARSER
+# ==================================================
+def convert_gdrive_to_direct(url):
+    """
+    Convert Google Drive share link to direct download URL
+    """
+    patterns = [
+        r"https://drive.google.com/file/d/([a-zA-Z0-9_-]+)",
+        r"https://drive.google.com/open\?id=([a-zA-Z0-9_-]+)",
+        r"https://drive.google.com/uc\?id=([a-zA-Z0-9_-]+)"
+    ]
+
+    for p in patterns:
+        match = re.search(p, url)
+        if match:
+            file_id = match.group(1)
+            return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    return url  # fallback kalau bukan gdrive
 
 # ==================================================
 # FFMPEG RUNNER
@@ -90,17 +111,17 @@ def run_ffmpeg(stream_id, video_url, stream_key, is_shorts):
     for line in proc.stdout:
         logs = st.session_state.streams[stream_id]["logs"]
         logs.append(line.strip())
-        st.session_state.streams[stream_id]["logs"] = logs[-40:]
+        st.session_state.streams[stream_id]["logs"] = logs[-50:]
 
 # ==================================================
 # FORM TAMBAH STREAM
 # ==================================================
-st.markdown("## ➕ Tambah Stream Baru")
+st.markdown("## ➕ Tambah Stream")
 
 with st.form("add_stream"):
-    video_url = st.text_input(
-        "Direct Video URL (MP4 / FLV)",
-        placeholder="https://example.com/video.mp4"
+    gdrive_url = st.text_input(
+        "Google Drive Video Link",
+        placeholder="https://drive.google.com/file/d/xxxxx/view"
     )
 
     stream_key = st.text_input(
@@ -116,20 +137,22 @@ with st.form("add_stream"):
     submit = st.form_submit_button("Tambah Stream")
 
     if submit:
-        if not video_url or not stream_key:
-            st.error("❌ Video URL dan Stream Key wajib diisi")
+        if not gdrive_url or not stream_key:
+            st.error("❌ Link Google Drive dan Stream Key wajib diisi")
         else:
+            direct_url = convert_gdrive_to_direct(gdrive_url)
             sid = str(uuid.uuid4())[:8]
 
             st.session_state.streams[sid] = {
-                "video_url": video_url,
+                "video_url": direct_url,
                 "key": stream_key,
                 "shorts": mode.startswith("Shorts"),
                 "process": None,
                 "logs": []
             }
 
-            st.success(f"✅ Stream `{sid}` ditambahkan")
+            st.success("✅ Stream berhasil ditambahkan")
+            st.code(direct_url)
 
 st.divider()
 
@@ -146,7 +169,7 @@ else:
             st.markdown('<div class="card">', unsafe_allow_html=True)
 
             st.markdown(f"### Stream ID: `{sid}`")
-            st.markdown(f"<small>🔗 URL: {data['video_url']}</small>", unsafe_allow_html=True)
+            st.markdown(f"<small>🔗 Source: {data['video_url']}</small>", unsafe_allow_html=True)
             st.markdown(f"<small>📐 Mode: {'Shorts' if data['shorts'] else 'Landscape'}</small>", unsafe_allow_html=True)
 
             col1, col2 = st.columns(2)
@@ -161,8 +184,6 @@ else:
                         )
                         t.start()
                         st.success("Streaming dimulai")
-                    else:
-                        st.warning("Stream sudah berjalan")
 
             with col2:
                 if st.button(f"🛑 STOP {sid}", key=f"stop_{sid}"):
