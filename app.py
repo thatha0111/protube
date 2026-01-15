@@ -6,147 +6,215 @@ import time
 import streamlit as st
 import tempfile
 import shutil
+from pathlib import Path
 
-# Install dependencies jika belum ada
-def install_package(package):
+# Remove the automatic package installation section
+# Streamlit Cloud doesn't allow installing packages at runtime
+
+# Remove the import of streamlit-option-menu since it's not available in requirements.txt
+# We'll use Streamlit's native components instead
+
+
+def get_video_info(video_path):
+    """Get video information using ffprobe"""
     try:
-        __import__(package.replace("-", ""))
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-# Install paket yang diperlukan
-install_package("streamlit")
-install_package("streamlit-option-menu")
-
-from streamlit_option_menu import option_menu
-
-
-def optimize_video_for_streaming(video_path, output_path, is_shorts=False):
-    """Optimasi video untuk streaming dengan kompresi"""
-    try:
-        st.info("🔧 Mengoptimasi video untuk streaming...")
+        cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height,duration,bit_rate,codec_name',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            video_path
+        ]
         
-        scale_filter = "scale=720:1280" if is_shorts else "scale=1280:720"
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            info = result.stdout.strip().split('\n')
+            if len(info) >= 5:
+                return {
+                    'width': info[0],
+                    'height': info[1],
+                    'duration': float(info[2]) if info[2] != 'N/A' else 0,
+                    'bitrate': info[3] if info[3] != 'N/A' else 'N/A',
+                    'codec': info[4]
+                }
+    except:
+        pass
+    return None
+
+
+def compress_video(input_path, output_path, target_size_mb=50):
+    """Compress video to target size"""
+    try:
+        st.info(f"📦 Mengompresi video ke {target_size_mb}MB...")
+        
+        # Get video duration
+        cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            input_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        duration = float(result.stdout.strip()) if result.returncode == 0 else 60
+        
+        # Calculate target bitrate (in kbps)
+        target_size_bits = target_size_mb * 8 * 1024  # Convert MB to kilobits
+        target_bitrate = int(target_size_bits / duration)  # kbps
+        
+        # Adjust bitrate for quality
+        video_bitrate = max(500, min(target_bitrate - 128, 4000))
+        audio_bitrate = 128
         
         cmd = [
-            "ffmpeg",
-            "-i", video_path,
-            "-vf", f"{scale_filter},fps=30",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-tune", "zerolatency",
-            "-crf", "23",  # Quality: lower = better quality, higher = smaller size
-            "-b:v", "2000k",
-            "-maxrate", "2500k",
-            "-bufsize", "5000k",
-            "-g", "60",
-            "-keyint_min", "60",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ar", "44100",
-            "-movflags", "+faststart",
-            "-y",  # Overwrite output file
+            'ffmpeg',
+            '-i', input_path,
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-b:v', f'{video_bitrate}k',
+            '-maxrate', f'{video_bitrate + 500}k',
+            '-bufsize', f'{video_bitrate * 2}k',
+            '-c:a', 'aac',
+            '-b:a', f'{audio_bitrate}k',
+            '-y',
             output_path
         ]
         
         process = subprocess.run(cmd, capture_output=True, text=True)
+        
         if process.returncode == 0:
-            st.success(f"✅ Video berhasil dioptimasi! Ukuran: {os.path.getsize(output_path) / (1024*1024):.2f} MB")
-            return output_path
+            final_size = os.path.getsize(output_path) / (1024 * 1024)
+            st.success(f"✅ Kompresi selesai! Ukuran akhir: {final_size:.2f}MB")
+            return True
         else:
-            st.error(f"❌ Error optimasi: {process.stderr}")
-            return video_path
-    except Exception as e:
-        st.error(f"❌ Error optimasi video: {e}")
-        return video_path
-
-
-def run_ffmpeg_stream(video_path, stream_key, is_shorts, log_callback):
-    """Menjalankan streaming ke YouTube"""
-    output_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
-    
-    # Gunakan video asli untuk streaming
-    scale_filter = "scale=720:1280" if is_shorts else "scale=1280:720"
-    
-    cmd = [
-        "ffmpeg",
-        "-stream_loop", "-1",
-        "-re",  # Real-time mode
-        "-i", video_path,
-        "-vf", f"{scale_filter},fps=30",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-tune", "zerolatency",
-        "-b:v", "2500k",
-        "-maxrate", "3000k",
-        "-bufsize", "6000k",
-        "-g", "60",
-        "-keyint_min", "60",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ar", "44100",
-        "-f", "flv",
-        "-flvflags", "no_duration_filesize",
-        output_url
-    ]
-    
-    log_callback(f"🚀 Memulai streaming dengan command: {' '.join(cmd[:5])}...")
-    
-    try:
-        process = subprocess.Popen(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.STDOUT, 
-            universal_newlines=True,
-            bufsize=1
-        )
-        
-        for line in iter(process.stdout.readline, ''):
-            if line:
-                log_callback(line.strip())
-        
-        process.stdout.close()
-        return_code = process.wait()
-        
-        if return_code:
-            log_callback(f"⚠️ Proses streaming berhenti dengan kode: {return_code}")
-        else:
-            log_callback("✅ Streaming berhasil dihentikan")
+            st.error("❌ Gagal mengompresi video")
+            return False
             
     except Exception as e:
-        log_callback(f"❌ Error streaming: {str(e)}")
-    finally:
-        log_callback("📴 Streaming selesai")
+        st.error(f"❌ Error kompresi: {str(e)}")
+        return False
+
+
+def save_uploaded_file(uploaded_file, temp_dir):
+    """Save uploaded file with chunk processing"""
+    try:
+        file_path = os.path.join(temp_dir, uploaded_file.name)
+        
+        with st.spinner(f"💾 Menyimpan {uploaded_file.name}..."):
+            with open(file_path, "wb") as f:
+                # Process in chunks for large files
+                chunk_size = 1024 * 1024 * 5  # 5MB chunks
+                total_chunks = uploaded_file.size / chunk_size
+                progress_bar = st.progress(0)
+                
+                for i in range(0, uploaded_file.size, chunk_size):
+                    chunk = uploaded_file.getvalue()[i:i + chunk_size]
+                    f.write(chunk)
+                    progress = (i + len(chunk)) / uploaded_file.size
+                    progress_bar.progress(progress)
+                
+                progress_bar.progress(1.0)
+        
+        return file_path
+    except Exception as e:
+        st.error(f"❌ Error menyimpan file: {str(e)}")
+        return None
+
+
+def run_streaming(video_path, stream_key, is_shorts, quality):
+    """Run FFmpeg streaming process"""
+    try:
+        output_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
+        
+        # Quality settings
+        quality_settings = {
+            "720p": {"scale": "1280:720", "bitrate": "2500k"},
+            "1080p": {"scale": "1920:1080", "bitrate": "4000k"},
+            "shorts": {"scale": "720:1280", "bitrate": "2500k"}
+        }
+        
+        scale = quality_settings["shorts"]["scale"] if is_shorts else quality_settings[quality]["scale"]
+        bitrate = quality_settings["shorts"]["bitrate"] if is_shorts else quality_settings[quality]["bitrate"]
+        
+        cmd = [
+            "ffmpeg",
+            "-re",
+            "-stream_loop", "-1",
+            "-i", video_path,
+            "-vf", f"{scale},fps=30",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-tune", "zerolatency",
+            "-b:v", bitrate,
+            "-maxrate", bitrate,
+            "-bufsize", f"{int(bitrate[:-1]) * 2}k",
+            "-g", "60",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-ar", "44100",
+            "-f", "flv",
+            output_url
+        ]
+        
+        st.session_state['stream_process'] = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True
+        )
+        
+        # Start log reader thread
+        def read_logs():
+            while st.session_state.get('streaming', False):
+                try:
+                    line = st.session_state['stream_process'].stdout.readline()
+                    if line:
+                        timestamp = time.strftime("%H:%M:%S")
+                        st.session_state.setdefault('logs', []).append(f"{timestamp} - {line.strip()}")
+                except:
+                    break
+        
+        log_thread = threading.Thread(target=read_logs, daemon=True)
+        log_thread.start()
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Error memulai streaming: {str(e)}")
+        return False
 
 
 def main():
+    # Page configuration
     st.set_page_config(
-        page_title="YouTube Live Streamer Pro",
+        page_title="YouTube Live Streamer",
         page_icon="🎥",
-        layout="wide",
-        initial_sidebar_state="expanded"
+        layout="wide"
     )
     
-    # CSS styling
+    # Custom CSS
     st.markdown("""
     <style>
-    .stButton>button {
-        width: 100%;
+    .main-header {
+        text-align: center;
+        padding: 20px;
         background: linear-gradient(45deg, #FF0000, #FF6B6B);
         color: white;
-        font-weight: bold;
-        border: none;
-        padding: 12px;
-        border-radius: 8px;
+        border-radius: 10px;
+        margin-bottom: 20px;
     }
-    .stButton>button:hover {
-        background: linear-gradient(45deg, #CC0000, #FF5252);
-    }
-    .video-info {
+    .video-card {
         background: #f0f2f6;
         padding: 15px;
         border-radius: 10px;
         margin: 10px 0;
+    }
+    .stream-button {
+        background: linear-gradient(45deg, #FF0000, #FF6B6B) !important;
+        color: white !important;
+        border: none !important;
     }
     .log-container {
         background: #1e1e1e;
@@ -154,214 +222,185 @@ def main():
         padding: 15px;
         border-radius: 10px;
         font-family: 'Courier New', monospace;
+        font-size: 12px;
         max-height: 300px;
         overflow-y: auto;
     }
     </style>
     """, unsafe_allow_html=True)
     
-    # Sidebar menu
+    # Header
+    st.markdown('<div class="main-header"><h1>🎥 YouTube Live Streamer</h1></div>', unsafe_allow_html=True)
+    
+    # Initialize session state
+    if 'streaming' not in st.session_state:
+        st.session_state.streaming = False
+    if 'logs' not in st.session_state:
+        st.session_state.logs = []
+    
+    # Sidebar
     with st.sidebar:
-        st.image("https://cdn-icons-png.flaticon.com/512/1384/1384060.png", width=100)
-        st.title("🎬 Streamer Pro")
+        st.header("⚙️ Pengaturan")
         
-        selected = option_menu(
-            menu_title=None,
-            options=["📤 Upload Video", "⚙️ Settings", "📊 Stats"],
-            icons=["cloud-upload", "gear", "graph-up"],
-            default_index=0,
+        # Stream key input
+        stream_key = st.text_input(
+            "🔑 YouTube Stream Key",
+            type="password",
+            help="Dapatkan dari YouTube Studio > Live Dashboard"
+        )
+        
+        # Quality settings
+        st.subheader("🎬 Kualitas Streaming")
+        quality = st.selectbox(
+            "Resolusi",
+            ["720p", "1080p"],
+            index=0
+        )
+        
+        is_shorts = st.checkbox("📱 Mode Shorts (Vertikal)", value=False)
+        
+        # Compression settings
+        st.subheader("📦 Kompresi Video")
+        auto_compress = st.checkbox("Otomatis kompres video besar", value=True)
+        compress_size = st.slider(
+            "Target ukuran (MB)",
+            min_value=10,
+            max_value=200,
+            value=50,
+            help="Video akan dikompresi ke ukuran ini"
         )
     
     # Main content
-    st.title("🎥 YouTube Live Streamer Pro")
-    st.markdown("---")
+    col1, col2 = st.columns([2, 1])
     
-    # Tab untuk streaming
-    tab1, tab2, tab3 = st.tabs(["📤 Upload & Stream", "📁 File Manager", "📈 Logs"])
+    with col1:
+        # File upload section
+        st.subheader("📤 Upload Video")
+        
+        uploaded_file = st.file_uploader(
+            "Pilih video untuk di-streaming",
+            type=['mp4', 'avi', 'mov', 'mkv', 'flv'],
+            help="Format yang didukung: MP4, AVI, MOV, MKV, FLV"
+        )
+        
+        if uploaded_file is not None:
+            # Display file info
+            file_size_mb = uploaded_file.size / (1024 * 1024)
+            
+            st.markdown(f"""
+            <div class="video-card">
+            <h4>📄 {uploaded_file.name}</h4>
+            <p>📊 Ukuran: {file_size_mb:.2f} MB</p>
+            <p>📝 Tipe: {uploaded_file.type}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Save to temp file
+            temp_dir = tempfile.mkdtemp()
+            temp_video_path = save_uploaded_file(uploaded_file, temp_dir)
+            
+            if temp_video_path:
+                st.session_state.temp_dir = temp_dir
+                st.session_state.video_path = temp_video_path
+                
+                # Show compression option for large files
+                if file_size_mb > 100 and auto_compress:
+                    if st.button("⚡ Kompres Video untuk Streaming", type="primary"):
+                        compressed_path = os.path.join(temp_dir, "compressed.mp4")
+                        if compress_video(temp_video_path, compressed_path, compress_size):
+                            st.session_state.video_path = compressed_path
+                            st.success("✅ Video siap untuk streaming!")
     
-    with tab1:
-        col1, col2 = st.columns([2, 1])
+    with col2:
+        # Streaming control
+        st.subheader("🎮 Kontrol Streaming")
         
-        with col1:
-            # Upload video dengan chunk untuk file besar
-            uploaded_file = st.file_uploader(
-                "📁 Upload Video (MP4, MKV, AVI, MOV) - Max 2GB",
-                type=['mp4', 'mkv', 'avi', 'mov', 'flv'],
-                help="Upload video untuk di-streaming"
-            )
-            
-            if uploaded_file:
-                # Tampilkan info video
-                file_size_mb = uploaded_file.size / (1024 * 1024)
-                
-                with st.expander("📊 Video Info", expanded=True):
-                    col_info1, col_info2, col_info3 = st.columns(3)
-                    with col_info1:
-                        st.metric("Ukuran File", f"{file_size_mb:.2f} MB")
-                    with col_info2:
-                        st.metric("Format", uploaded_file.type)
-                    with col_info3:
-                        st.metric("Status", "✅ Siap" if file_size_mb < 1000 else "⚠️ Perlu Optimasi")
-                
-                # Simpan file ke temporary directory
-                temp_dir = tempfile.mkdtemp()
-                video_path = os.path.join(temp_dir, uploaded_file.name)
-                
-                with st.spinner(f"⏳ Menyimpan file ({file_size_mb:.1f} MB)..."):
-                    with open(video_path, "wb") as f:
-                        # Baca dalam chunk untuk file besar
-                        chunk_size = 1024 * 1024 * 10  # 10MB chunks
-                        progress_bar = st.progress(0)
-                        
-                        for i, chunk in enumerate(uploaded_file.getbuffer()):
-                            f.write(chunk)
-                            if (i + 1) % (chunk_size // len(chunk)) == 0:
-                                progress = min((i + 1) / (file_size_mb * 1024), 1.0)
-                                progress_bar.progress(progress)
-                        
-                        progress_bar.progress(1.0)
-                        st.session_state['video_path'] = video_path
-                        st.session_state['temp_dir'] = temp_dir
-                        st.success(f"✅ Video '{uploaded_file.name}' berhasil diupload!")
-            
-            # Input stream key
-            st.subheader("🔐 YouTube Stream Key")
-            stream_key = st.text_input(
-                "Masukkan Stream Key Anda:",
-                type="password",
-                help="Dapatkan dari YouTube Studio > Live Streaming"
-            )
-            
-            # Settings
-            st.subheader("⚙️ Streaming Settings")
-            col_set1, col_set2 = st.columns(2)
-            with col_set1:
-                is_shorts = st.checkbox("📱 Mode Shorts (9:16)", value=False)
-                auto_optimize = st.checkbox("🔧 Auto Optimize", value=True)
-            with col_set2:
-                stream_quality = st.selectbox(
-                    "Quality",
-                    ["HD (720p)", "Full HD (1080p)", "Custom"],
-                    index=0
-                )
+        col_btn1, col_btn2 = st.columns(2)
         
-        with col2:
-            st.subheader("🎯 Quick Actions")
-            
-            if 'video_path' in st.session_state and stream_key:
-                if st.button("🚀 Start Streaming", type="primary", use_container_width=True):
-                    with st.spinner("🔄 Memulai streaming..."):
-                        # Optimasi video jika diperlukan
-                        if auto_optimize and file_size_mb > 500:
-                            optimized_path = os.path.join(st.session_state['temp_dir'], "optimized.mp4")
-                            st.session_state['video_path'] = optimize_video_for_streaming(
-                                st.session_state['video_path'],
-                                optimized_path,
-                                is_shorts
-                            )
-                        
-                        # Jalankan streaming di thread terpisah
-                        st.session_state['streaming'] = True
-                        st.session_state['logs'] = []
-                        
-                        def log_callback(msg):
-                            if 'logs' in st.session_state:
-                                st.session_state['logs'].append(f"{time.strftime('%H:%M:%S')} - {msg}")
-                        
-                        thread = threading.Thread(
-                            target=run_ffmpeg_stream,
-                            args=(st.session_state['video_path'], stream_key, is_shorts, log_callback),
-                            daemon=True
-                        )
-                        st.session_state['stream_thread'] = thread
-                        thread.start()
-                        
+        with col_btn1:
+            start_disabled = not (stream_key and 'video_path' in st.session_state)
+            if st.button(
+                "🚀 Mulai Streaming",
+                type="primary",
+                disabled=start_disabled,
+                use_container_width=True
+            ):
+                if not stream_key:
+                    st.error("❌ Masukkan Stream Key terlebih dahulu")
+                elif 'video_path' not in st.session_state:
+                    st.error("❌ Upload video terlebih dahulu")
+                else:
+                    # Start streaming
+                    if run_streaming(
+                        st.session_state.video_path,
+                        stream_key,
+                        is_shorts,
+                        quality
+                    ):
+                        st.session_state.streaming = True
                         st.success("✅ Streaming dimulai!")
                         st.balloons()
-            
-            if st.button("🛑 Stop Streaming", use_container_width=True):
-                if 'streaming' in st.session_state and st.session_state['streaming']:
-                    os.system("pkill -f ffmpeg")
-                    st.session_state['streaming'] = False
+                    else:
+                        st.error("❌ Gagal memulai streaming")
+        
+        with col_btn2:
+            if st.button(
+                "🛑 Stop Streaming",
+                type="secondary",
+                disabled=not st.session_state.streaming,
+                use_container_width=True
+            ):
+                if 'stream_process' in st.session_state:
+                    st.session_state.stream_process.terminate()
+                    st.session_state.streaming = False
                     st.warning("⏸️ Streaming dihentikan")
-            
-            if st.button("🧹 Clear All", use_container_width=True):
-                keys = list(st.session_state.keys())
-                for key in keys:
-                    del st.session_state[key]
-                st.rerun()
-            
-            st.markdown("---")
-            st.subheader("📋 Tips")
-            st.info("""
-            1. Pastikan koneksi internet stabil
-            2. Gunakan video H.264 untuk kompatibilitas terbaik
-            3. Mode Shorts cocok untuk TikTok/YouTube Shorts
-            4. File >500MB direkomendasikan di-optimasi
-            """)
-    
-    with tab2:
-        st.subheader("📂 Video Files")
         
-        # List video files in current directory
-        video_extensions = ('.mp4', '.mkv', '.avi', '.mov', '.flv')
-        video_files = [f for f in os.listdir('.') if f.lower().endswith(video_extensions)]
-        
-        if video_files:
-            for video in video_files:
-                col_file1, col_file2, col_file3, col_file4 = st.columns([3, 1, 1, 1])
-                with col_file1:
-                    st.write(f"🎬 {video}")
-                with col_file2:
-                    size_mb = os.path.getsize(video) / (1024 * 1024)
-                    st.write(f"{size_mb:.1f} MB")
-                with col_file3:
-                    if st.button("📤 Select", key=f"select_{video}"):
-                        st.session_state['video_path'] = video
-                        st.success(f"✅ {video} dipilih!")
-                with col_file4:
-                    if st.button("🗑️", key=f"del_{video}"):
-                        try:
-                            os.remove(video)
-                            st.rerun()
-                        except:
-                            st.error(f"❌ Gagal menghapus {video}")
+        # Status indicator
+        st.subheader("📊 Status")
+        if st.session_state.streaming:
+            st.success("🔴 LIVE - Sedang streaming")
         else:
-            st.info("📭 Tidak ada video di direktori ini")
+            st.info("⚪ OFFLINE - Tidak streaming")
     
-    with tab3:
-        st.subheader("📈 Streaming Logs")
-        
-        if 'logs' in st.session_state and st.session_state['logs']:
-            log_container = st.container()
-            with log_container:
-                st.markdown('<div class="log-container">', unsafe_allow_html=True)
-                for log in st.session_state['logs'][-50:]:  # Tampilkan 50 log terakhir
-                    st.text(log)
-                st.markdown('</div>', unsafe_allow_html=True)
-            
-            col_log1, col_log2 = st.columns(2)
-            with col_log1:
-                if st.button("🔄 Refresh Logs"):
-                    st.rerun()
-            with col_log2:
-                if st.button("🗑️ Clear Logs"):
-                    st.session_state['logs'] = []
-                    st.rerun()
+    # Logs section
+    st.subheader("📜 Log Streaming")
+    
+    # Create log container
+    log_container = st.container()
+    
+    with log_container:
+        st.markdown('<div class="log-container">', unsafe_allow_html=True)
+        if st.session_state.logs:
+            for log in st.session_state.logs[-20:]:  # Show last 20 logs
+                st.text(log)
         else:
-            st.info("📭 Tidak ada logs streaming")
+            st.text("Tidak ada log untuk ditampilkan...")
+        st.markdown('</div>', unsafe_allow_html=True)
     
-    # Cleanup pada session end
-    if 'temp_dir' in st.session_state and os.path.exists(st.session_state['temp_dir']):
-        if not st.session_state.get('streaming', False):
-            try:
-                shutil.rmtree(st.session_state['temp_dir'])
-            except:
-                pass
+    # Log controls
+    col_log1, col_log2 = st.columns(2)
+    with col_log1:
+        if st.button("🗑️ Hapus Log"):
+            st.session_state.logs = []
+            st.rerun()
+    with col_log2:
+        if st.button("🔄 Refresh"):
+            st.rerun()
+    
+    # Cleanup on stop
+    if not st.session_state.streaming and 'temp_dir' in st.session_state:
+        try:
+            shutil.rmtree(st.session_state.temp_dir)
+            del st.session_state.temp_dir
+            if 'video_path' in st.session_state:
+                del st.session_state.video_path
+        except:
+            pass
     
     # Footer
     st.markdown("---")
-    st.caption("© 2024 YouTube Live Streamer Pro | Gunakan dengan bijak")
+    st.caption("⚠️ Pastikan Anda memiliki izin untuk menyiarkan konten ini")
+    st.caption("🎬 Streamer v1.0 - Untuk file hingga 2GB")
 
 
 if __name__ == '__main__':
